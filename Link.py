@@ -1,9 +1,8 @@
 """
-LLM Model Probing & Link Authority Analysis Dashboard - PRODUCTION VERSION
-Complete Streamlit Application with Google Gemini API and Offline Semantic Similarity
-Author: Advanced Analytics Team
+LLM Model Probing & Link Authority Analysis Dashboard
+PRODUCTION VERSION - Advanced Visualizations & Key Findings
+Version: 4.0
 Date: November 2025
-Version: 2.1 (Production - Offline Similarity)
 """
 
 import streamlit as st
@@ -12,6 +11,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 from datetime import datetime
 import os
@@ -24,6 +25,13 @@ from io import StringIO
 import base64
 from dotenv import load_dotenv
 import logging
+from urllib.parse import urlparse, urlunparse
+import random
+import chardet
+from scipy import stats
+
+# BeautifulSoup for parsing
+from bs4 import BeautifulSoup
 
 # Google Gemini imports
 try:
@@ -32,24 +40,36 @@ try:
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-    st.warning("⚠️ Google Gemini SDK not installed. Run: pip install google-genai")
 
-# Sentence Transformers for offline semantic similarity
+# Sentence Transformers
 try:
     from sentence_transformers import SentenceTransformer, util
-    from bs4 import BeautifulSoup
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
-    st.warning("⚠️ Sentence Transformers not installed. Run: pip install sentence-transformers beautifulsoup4")
 
-# Load environment variables
+# Selenium
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('scraper.log', encoding='utf-8')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -89,10 +109,6 @@ st.markdown("""
         border-radius: 15px;
         color: white;
         box-shadow: 0 8px 16px rgba(0,0,0,0.2);
-        transition: transform 0.3s;
-    }
-    .metric-card:hover {
-        transform: translateY(-5px);
     }
     .success-card {
         background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
@@ -121,30 +137,6 @@ st.markdown("""
         border-left: 5px solid #1f77b4;
         border-radius: 8px;
         margin: 1rem 0;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .stTab {
-        font-size: 1.2rem;
-        font-weight: 600;
-    }
-    .score-badge {
-        display: inline-block;
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-weight: 600;
-        font-size: 0.9rem;
-    }
-    .score-high {
-        background-color: #38ef7d;
-        color: #1a5928;
-    }
-    .score-medium {
-        background-color: #ffd93d;
-        color: #6b5b00;
-    }
-    .score-low {
-        background-color: #f5576c;
-        color: white;
     }
     .api-status {
         padding: 0.5rem 1rem;
@@ -161,10 +153,24 @@ st.markdown("""
         background-color: #f5576c;
         color: white;
     }
+    .finding-box {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        border-left: 5px solid #667eea;
+    }
+    .critical-finding {
+        background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);
+        color: white;
+        padding: 1.5rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== SESSION STATE INITIALIZATION ====================
+# ==================== SESSION STATE ====================
 if 'probe_results' not in st.session_state:
     st.session_state.probe_results = []
 if 'link_analysis_results' not in st.session_state:
@@ -178,11 +184,277 @@ if 'similarity_model' not in st.session_state:
 if 'similarity_model_loaded' not in st.session_state:
     st.session_state.similarity_model_loaded = False
 
-# ==================== API CLIENT CLASSES ====================
+# ==================== WEB SCRAPER (PREVIOUS CODE) ====================
+
+class SequentialWebScraper:
+    """Sequential web scraper with rate limiting"""
+    
+    def __init__(self, delay_between_requests: float = 2.0):
+        self.session = self._create_session()
+        self.delay = delay_between_requests
+        self.cache = {}
+        
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15'
+        ]
+    
+    def _create_session(self) -> requests.Session:
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+    
+    def _get_random_headers(self) -> Dict:
+        return {
+            'User-Agent': random.choice(self.user_agents),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        }
+    
+    def _detect_encoding(self, content: bytes) -> str:
+        try:
+            result = chardet.detect(content)
+            encoding = result['encoding']
+            if encoding:
+                return encoding
+        except:
+            pass
+        return 'utf-8'
+    
+    def _decode_content(self, content: bytes) -> str:
+        try:
+            encoding = self._detect_encoding(content)
+            return content.decode(encoding, errors='ignore')
+        except:
+            pass
+        
+        for encoding in ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252', 'ascii']:
+            try:
+                return content.decode(encoding, errors='ignore')
+            except:
+                continue
+        
+        return content.decode('utf-8', errors='ignore')
+    
+    def _clean_text(self, soup: BeautifulSoup) -> str:
+        for element in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 
+                            'iframe', 'noscript', 'svg', 'form', 'button', 'meta', 'link']):
+            element.decompose()
+        
+        text = None
+        
+        for tag in ['main', 'article', '[role="main"]', '.content', '#content', '.post', '.entry', '.article-body']:
+            try:
+                element = soup.select_one(tag)
+                if element:
+                    text = element.get_text(separator=' ', strip=True)
+                    if len(text) > 200:
+                        break
+            except:
+                continue
+        
+        if not text or len(text) < 200:
+            try:
+                paragraphs = soup.find_all('p')
+                if paragraphs:
+                    text = ' '.join([p.get_text(separator=' ', strip=True) for p in paragraphs])
+            except:
+                pass
+        
+        if not text or len(text) < 100:
+            try:
+                body = soup.find('body')
+                if body:
+                    text = body.get_text(separator=' ', strip=True)
+            except:
+                pass
+        
+        if text:
+            try:
+                lines = (line.strip() for line in text.splitlines())
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                text = ' '.join(chunk for chunk in chunks if chunk)
+                text = text.encode('ascii', errors='ignore').decode('ascii')
+                return text[:5000]
+            except:
+                return text[:5000]
+        
+        return ""
+    
+    def extract_text_basic(self, url: str, timeout: int = 15) -> Tuple[Optional[str], str]:
+        if url in self.cache:
+            logger.info(f"Cache hit for {url}")
+            return self.cache[url]
+        
+        try:
+            headers = self._get_random_headers()
+            time.sleep(self.delay + random.uniform(0, 1))
+            
+            response = self.session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            response.raise_for_status()
+            
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/html' not in content_type and 'application/xhtml' not in content_type:
+                result = (None, f"non_html")
+                self.cache[url] = result
+                return result
+            
+            html_content = self._decode_content(response.content)
+            
+            try:
+                soup = BeautifulSoup(html_content, 'lxml')
+            except:
+                soup = BeautifulSoup(html_content, 'html.parser')
+            
+            text = self._clean_text(soup)
+            
+            if len(text) > 50:
+                logger.info(f"✓ Extracted {len(text)} chars from {url}")
+                result = (text, "basic_success")
+                self.cache[url] = result
+                return result
+            
+            logger.warning(f"Insufficient text from {url}")
+            result = (None, "insufficient_text")
+            self.cache[url] = result
+            return result
+            
+        except requests.exceptions.HTTPError as e:
+            error_msg = f"http_{e.response.status_code}"
+            logger.error(f"HTTP {e.response.status_code} for {url}")
+            result = (None, error_msg)
+            self.cache[url] = result
+            return result
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout for {url}")
+            return (None, "timeout")
+        except requests.exceptions.ConnectionError:
+            logger.error(f"Connection error for {url}")
+            return (None, "connection_error")
+        except Exception as e:
+            logger.error(f"Error for {url}: {str(e)[:100]}")
+            return (None, "error")
+    
+    def extract_text_selenium(self, url: str, timeout: int = 20) -> Tuple[Optional[str], str]:
+        if not SELENIUM_AVAILABLE:
+            return (None, "selenium_unavailable")
+        
+        driver = None
+        try:
+            chrome_options = Options()
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument(f'user-agent={random.choice(self.user_agents)}')
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument('--log-level=3')
+            
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver.set_page_load_timeout(timeout)
+            
+            time.sleep(self.delay + random.uniform(0, 1))
+            
+            driver.get(url)
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            time.sleep(2)
+            
+            page_source = driver.page_source
+            html_content = self._decode_content(page_source.encode('utf-8'))
+            
+            try:
+                soup = BeautifulSoup(html_content, 'lxml')
+            except:
+                soup = BeautifulSoup(html_content, 'html.parser')
+            
+            text = self._clean_text(soup)
+            
+            if len(text) > 50:
+                logger.info(f"✓ Extracted {len(text)} chars from {url} (Selenium)")
+                result = (text, "selenium_success")
+                self.cache[url] = result
+                return result
+            
+            return (None, "selenium_insufficient")
+            
+        except Exception as e:
+            logger.error(f"Selenium error for {url}: {str(e)[:100]}")
+            return (None, "selenium_error")
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+    
+    def extract_text_with_fallback(self, url: str) -> Tuple[Optional[str], str]:
+        text, method = self.extract_text_basic(url)
+        if text and len(text) > 50:
+            return text, method
+        
+        logger.warning(f"Basic failed for {url}, trying Selenium...")
+        
+        text, method = self.extract_text_selenium(url)
+        if text and len(text) > 50:
+            return text, method
+        
+        logger.error(f"All methods failed for {url}")
+        return None, "all_failed"
+    
+    def extract_bulk_sequential(self, urls: List[str], progress_callback=None) -> Dict[str, Tuple[Optional[str], str]]:
+        results = {}
+        total = len(urls)
+        unique_urls = list(dict.fromkeys(urls))
+        logger.info(f"Processing {len(unique_urls)} unique URLs sequentially...")
+        
+        for idx, url in enumerate(unique_urls):
+            try:
+                text, method = self.extract_text_with_fallback(url)
+                results[url] = (text, method)
+                
+                if progress_callback:
+                    progress_callback(idx + 1, total)
+                
+                logger.info(f"Progress: {idx+1}/{len(unique_urls)} URLs processed")
+                
+            except Exception as e:
+                logger.error(f"Error processing {url}: {e}")
+                results[url] = (None, "exception")
+                
+                if progress_callback:
+                    progress_callback(idx + 1, total)
+        
+        return results
+
+# ==================== GEMINI & SIMILARITY CLIENTS (PREVIOUS CODE) ====================
 
 class GeminiClient:
-    """Google Gemini API Client for LLM Probing"""
-    
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.client = None
@@ -193,16 +465,13 @@ class GeminiClient:
                 os.environ["GEMINI_API_KEY"] = api_key
                 self.client = genai.Client(api_key=api_key)
                 self.is_connected = True
-                logger.info("Gemini client initialized successfully")
+                logger.info("Gemini connected")
             except Exception as e:
-                logger.error(f"Failed to initialize Gemini client: {e}")
-                self.is_connected = False
+                logger.error(f"Gemini init failed: {e}")
     
     def generate_response(self, prompt: str, model: str = "gemini-2.0-flash-exp", 
                          temperature: float = 0.1, max_retries: int = 3) -> Optional[str]:
-        """Generate response from Gemini API with retry logic"""
-        if not self.is_connected or not self.client:
-            logger.error("Gemini client not connected")
+        if not self.is_connected:
             return None
         
         for attempt in range(max_retries):
@@ -219,212 +488,67 @@ class GeminiClient:
                 )
                 
                 if response and response.text:
-                    logger.info(f"Gemini response generated successfully (attempt {attempt + 1})")
                     return response.text.strip()
                     
             except Exception as e:
-                logger.warning(f"Gemini API call failed (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.warning(f"Gemini call failed (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
-                else:
-                    logger.error(f"All retry attempts failed: {e}")
-                    return None
         
         return None
     
     def check_needs_retrieval(self, question: str, answer: str) -> bool:
-        """Ask Gemini if it needed retrieval to answer the question"""
         if not self.is_connected:
             return False
         
-        self_check_prompt = f"""You were asked: "{question}"
+        prompt = f"""You were asked: "{question}"
 You answered: "{answer}"
 
-Did you rely only on your prior training knowledge to answer this, or would you need to retrieve/search for this specific information to be confident? 
+Did you rely only on prior knowledge, or would you need retrieval?
 Respond with only 'PRIOR_KNOWLEDGE' or 'NEEDS_RETRIEVAL'."""
         
         try:
-            response = self.generate_response(self_check_prompt, temperature=0.0)
-            if response and 'NEEDS_RETRIEVAL' in response.upper():
-                return True
-        except Exception as e:
-            logger.warning(f"Self-check failed: {e}")
-        
-        return False
-
+            response = self.generate_response(prompt, temperature=0.0)
+            return 'NEEDS_RETRIEVAL' in response.upper() if response else False
+        except:
+            return False
 
 class OfflineSemanticSimilarity:
-    """Offline Semantic Similarity using Sentence Transformers"""
-    
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """
-        Initialize offline semantic similarity model
-        
-        Args:
-            model_name: Sentence transformer model name
-        """
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", delay: float = 2.0):
         self.model_name = model_name
         self.model = None
         self.is_loaded = False
-        
+        self.scraper = SequentialWebScraper(delay_between_requests=delay)
+    
     def load_model(self):
-        """Load the sentence transformer model"""
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
-            logger.error("Sentence Transformers not available")
             return False
         
         try:
             logger.info(f"Loading model: {self.model_name}")
             self.model = SentenceTransformer(self.model_name)
             self.is_loaded = True
-            logger.info("Model loaded successfully")
+            logger.info("Model loaded")
             return True
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            self.is_loaded = False
+            logger.error(f"Model load failed: {e}")
             return False
     
-    def extract_text_from_url(self, url: str, timeout: int = 10) -> Optional[str]:
-        """
-        Extract text content from a URL
-        
-        Args:
-            url: URL to extract text from
-            timeout: Request timeout in seconds
-            
-        Returns:
-            Extracted text content or None if failed
-        """
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            response = requests.get(url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove script and style elements
-            for script in soup(["script", "style", "nav", "footer", "header"]):
-                script.decompose()
-            
-            # Get text
-            text = soup.get_text(separator=' ', strip=True)
-            
-            # Clean up whitespace
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = ' '.join(chunk for chunk in chunks if chunk)
-            
-            # Limit to first 5000 characters for efficiency
-            text = text[:5000]
-            
-            logger.info(f"Extracted {len(text)} characters from {url}")
-            return text
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"Timeout extracting text from {url}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error extracting text from {url}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error extracting text from {url}: {e}")
-            return None
-    
     def calculate_similarity(self, text1: str, text2: str) -> Optional[float]:
-        """
-        Calculate semantic similarity between two texts
-        
-        Args:
-            text1: First text
-            text2: Second text
-            
-        Returns:
-            Similarity score (0-1) or None if failed
-        """
-        if not self.is_loaded or not self.model:
-            logger.error("Model not loaded")
+        if not self.is_loaded:
             return None
         
         try:
-            # Generate embeddings
             embedding1 = self.model.encode(text1, convert_to_tensor=True)
             embedding2 = self.model.encode(text2, convert_to_tensor=True)
-            
-            # Calculate cosine similarity
             similarity = util.cos_sim(embedding1, embedding2)
-            
-            # Convert to float
-            score = float(similarity.item())
-            
-            logger.info(f"Calculated similarity: {score:.3f}")
-            return score
-            
+            return float(similarity.item())
         except Exception as e:
-            logger.error(f"Error calculating similarity: {e}")
+            logger.error(f"Similarity error: {e}")
             return None
-    
-    def get_similarity(self, external_url: str, target_url: str) -> Optional[Dict]:
-        """
-        Get semantic similarity score between two URLs
-        
-        Args:
-            external_url: The external/linking page URL
-            target_url: The target/linked page URL
-            
-        Returns:
-            Dictionary with similarity results or None if failed
-        """
-        if not self.is_loaded:
-            logger.error("Model not loaded")
-            return None
-        
-        logger.info(f"Analyzing similarity between {external_url} and {target_url}")
-        
-        # Extract text from both URLs
-        external_text = self.extract_text_from_url(external_url)
-        target_text = self.extract_text_from_url(target_url)
-        
-        if not external_text or not target_text:
-            logger.error("Could not extract text from one or both URLs")
-            return {
-                'external_url': external_url,
-                'target_url': target_url,
-                'similarity': 0.0,
-                'interpretation': 'Error',
-                'api_status': 'error',
-                'http_status': 400,
-                'timestamp': datetime.now().isoformat(),
-                'raw': json.dumps({'error': 'Failed to extract text'})
-            }
-        
-        # Calculate similarity
-        similarity_score = self.calculate_similarity(external_text, target_text)
-        
-        if similarity_score is None:
-            return None
-        
-        interpretation = self._get_interpretation(similarity_score)
-        
-        return {
-            'external_url': external_url,
-            'target_url': target_url,
-            'similarity': round(similarity_score, 3),
-            'interpretation': interpretation,
-            'api_status': 'success',
-            'http_status': 200,
-            'timestamp': datetime.now().isoformat(),
-            'raw': json.dumps({
-                'score': similarity_score,
-                'model': self.model_name,
-                'method': 'offline'
-            })
-        }
     
     @staticmethod
     def _get_interpretation(score: float) -> str:
-        """Convert similarity score to interpretation bucket"""
         if score >= 0.70:
             return "On-Topic"
         elif score >= 0.56:
@@ -433,11 +557,517 @@ class OfflineSemanticSimilarity:
             return "Weak"
         else:
             return "Off-Topic"
+    
+    def get_similarity(self, external_url: str, target_url: str) -> Optional[Dict]:
+        if not self.is_loaded:
+            return None
+        
+        logger.info(f"Analyzing: {external_url} vs {target_url}")
+        
+        external_text, ext_method = self.scraper.extract_text_with_fallback(external_url)
+        target_text, tgt_method = self.scraper.extract_text_with_fallback(target_url)
+        
+        if not external_text or not target_text:
+            return {
+                'external_url': external_url,
+                'target_url': target_url,
+                'similarity': 0.0,
+                'interpretation': 'Error',
+                'api_status': 'error',
+                'http_status': 400,
+                'timestamp': datetime.now().isoformat(),
+                'extraction_methods': f"ext:{ext_method}, tgt:{tgt_method}",
+                'raw': json.dumps({'error': 'Extraction failed'})
+            }
+        
+        similarity = self.calculate_similarity(external_text, target_text)
+        
+        if similarity is None:
+            similarity = 0.0
+        
+        return {
+            'external_url': external_url,
+            'target_url': target_url,
+            'similarity': round(similarity, 3),
+            'interpretation': self._get_interpretation(similarity),
+            'api_status': 'success',
+            'http_status': 200,
+            'timestamp': datetime.now().isoformat(),
+            'extraction_methods': f"ext:{ext_method}, tgt:{tgt_method}",
+            'raw': json.dumps({'score': similarity, 'model': self.model_name})
+        }
+    
+    def get_similarity_bulk(self, pairs: List[Tuple[str, str]], progress_callback=None) -> List[Dict]:
+        if not self.is_loaded:
+            return []
+        
+        logger.info(f"Bulk analysis of {len(pairs)} pairs (sequential)")
+        
+        all_urls = list(set([url for pair in pairs for url in pair]))
+        logger.info(f"Extracting from {len(all_urls)} unique URLs...")
+        
+        def extraction_progress(current, total):
+            if progress_callback:
+                progress_callback(int(current / total * 70), 100)
+        
+        url_texts = self.scraper.extract_bulk_sequential(all_urls, extraction_progress)
+        
+        results = []
+        total_pairs = len(pairs)
+        
+        for idx, (ext_url, tgt_url) in enumerate(pairs):
+            if progress_callback:
+                progress_callback(70 + int((idx + 1) / total_pairs * 30), 100)
+            
+            ext_text, ext_method = url_texts.get(ext_url, (None, 'not_found'))
+            tgt_text, tgt_method = url_texts.get(tgt_url, (None, 'not_found'))
+            
+            if not ext_text or not tgt_text:
+                results.append({
+                    'external_url': ext_url,
+                    'target_url': tgt_url,
+                    'similarity': 0.0,
+                    'interpretation': 'Error',
+                    'api_status': 'error',
+                    'http_status': 400,
+                    'timestamp': datetime.now().isoformat(),
+                    'extraction_methods': f"ext:{ext_method}, tgt:{tgt_method}",
+                    'raw': json.dumps({'error': 'Extraction failed'})
+                })
+                continue
+            
+            similarity = self.calculate_similarity(ext_text, tgt_text)
+            
+            if similarity is None:
+                similarity = 0.0
+            
+            results.append({
+                'external_url': ext_url,
+                'target_url': tgt_url,
+                'similarity': round(similarity, 3),
+                'interpretation': self._get_interpretation(similarity),
+                'api_status': 'success',
+                'http_status': 200,
+                'timestamp': datetime.now().isoformat(),
+                'extraction_methods': f"ext:{ext_method}, tgt:{tgt_method}",
+                'raw': json.dumps({'score': similarity, 'model': self.model_name})
+            })
+        
+        logger.info(f"Bulk complete: {len(results)} results")
+        return results
 
-# ==================== HELPER FUNCTIONS ====================
+# ==================== ADVANCED ANALYSIS FUNCTIONS ====================
+
+def analyze_key_findings(df: pd.DataFrame, domain_summary: pd.DataFrame) -> Dict:
+    """
+    Generate comprehensive key findings from analysis
+    """
+    findings = {
+        'overall_health': {},
+        'critical_issues': [],
+        'recommendations': [],
+        'statistics': {},
+        'risk_assessment': {}
+    }
+    
+    # Overall statistics
+    total_links = len(df)
+    avg_similarity = df['similarity'].mean()
+    median_similarity = df['similarity'].median()
+    std_similarity = df['similarity'].std()
+    
+    # Interpretation breakdown
+    interp_counts = df['interpretation'].value_counts()
+    off_topic_count = interp_counts.get('Off-Topic', 0)
+    on_topic_count = interp_counts.get('On-Topic', 0)
+    
+    # Domain analysis
+    total_domains = len(domain_summary)
+    flagged_domains = domain_summary['flagged'].sum()
+    
+    # Overall Health Score (0-100)
+    health_score = (on_topic_count / total_links * 40) + \
+                   ((1 - off_topic_count / total_links) * 30) + \
+                   ((1 - flagged_domains / total_domains) * 30 if total_domains > 0 else 0)
+    
+    findings['overall_health'] = {
+        'score': round(health_score, 1),
+        'grade': 'A' if health_score >= 90 else 'B' if health_score >= 80 else 'C' if health_score >= 70 else 'D' if health_score >= 60 else 'F',
+        'status': 'Excellent' if health_score >= 90 else 'Good' if health_score >= 80 else 'Fair' if health_score >= 70 else 'Poor' if health_score >= 60 else 'Critical'
+    }
+    
+    # Statistics
+    findings['statistics'] = {
+        'total_links': total_links,
+        'avg_similarity': round(avg_similarity, 3),
+        'median_similarity': round(median_similarity, 3),
+        'std_similarity': round(std_similarity, 3),
+        'on_topic': on_topic_count,
+        'off_topic': off_topic_count,
+        'on_topic_rate': round(on_topic_count / total_links * 100, 1),
+        'off_topic_rate': round(off_topic_count / total_links * 100, 1),
+        'total_domains': total_domains,
+        'flagged_domains': flagged_domains,
+        'domain_flag_rate': round(flagged_domains / total_domains * 100, 1) if total_domains > 0 else 0
+    }
+    
+    # Critical Issues
+    if off_topic_count / total_links > 0.3:
+        findings['critical_issues'].append({
+            'severity': 'HIGH',
+            'issue': 'High Off-Topic Rate',
+            'detail': f"{round(off_topic_count / total_links * 100, 1)}% of links are off-topic (threshold: 30%)",
+            'impact': 'Significant SEO penalty risk'
+        })
+    
+    if flagged_domains > 0:
+        findings['critical_issues'].append({
+            'severity': 'HIGH',
+            'issue': 'Suspect Link Farms Detected',
+            'detail': f"{flagged_domains} domains flagged as potential link farms",
+            'impact': 'Risk of manual action from search engines'
+        })
+    
+    if avg_similarity < 0.5:
+        findings['critical_issues'].append({
+            'severity': 'MEDIUM',
+            'issue': 'Low Average Similarity',
+            'detail': f"Average similarity of {round(avg_similarity, 3)} is below recommended threshold of 0.5",
+            'impact': 'Weak topical relevance of backlink profile'
+        })
+    
+    # Recommendations
+    if off_topic_count > 0:
+        findings['recommendations'].append({
+            'priority': 'HIGH',
+            'action': 'Remove Off-Topic Links',
+            'detail': f"Disavow or remove {off_topic_count} off-topic backlinks to improve link profile quality"
+        })
+    
+    if flagged_domains > 0:
+        findings['recommendations'].append({
+            'priority': 'CRITICAL',
+            'action': 'Address Link Farm Issues',
+            'detail': f"Immediately review and disavow links from {flagged_domains} flagged domains"
+        })
+    
+    if on_topic_count / total_links > 0.7:
+        findings['recommendations'].append({
+            'priority': 'LOW',
+            'action': 'Maintain Quality Standards',
+            'detail': "Continue building high-quality, topically relevant backlinks"
+        })
+    else:
+        findings['recommendations'].append({
+            'priority': 'MEDIUM',
+            'action': 'Improve Link Relevance',
+            'detail': "Focus on acquiring links from contextually relevant sources"
+        })
+    
+    # Risk Assessment
+    risk_level = 'LOW'
+    if health_score < 60 or flagged_domains > 3:
+        risk_level = 'CRITICAL'
+    elif health_score < 70 or flagged_domains > 0:
+        risk_level = 'HIGH'
+    elif health_score < 80:
+        risk_level = 'MEDIUM'
+    
+    findings['risk_assessment'] = {
+        'level': risk_level,
+        'manual_action_risk': 'High' if flagged_domains > 2 else 'Medium' if flagged_domains > 0 else 'Low',
+        'penalty_risk': 'High' if off_topic_count / total_links > 0.4 else 'Medium' if off_topic_count / total_links > 0.2 else 'Low'
+    }
+    
+    return findings
+
+def generate_advanced_report(df: pd.DataFrame, domain_summary: pd.DataFrame, findings: Dict) -> str:
+    """
+    Generate comprehensive markdown report with findings
+    """
+    report = f"# Advanced Link Authority Analysis Report\n\n"
+    report += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    report += f"**Total Links Analyzed:** {len(df)}\n"
+    report += f"**Total Domains:** {len(domain_summary)}\n\n"
+    report += "---\n\n"
+    
+    # Overall Health
+    report += "## 📊 Overall Health Score\n\n"
+    health = findings['overall_health']
+    report += f"**Score:** {health['score']}/100 (Grade: {health['grade']})\n"
+    report += f"**Status:** {health['status']}\n\n"
+    
+    # Statistics
+    report += "## 📈 Key Statistics\n\n"
+    stats = findings['statistics']
+    report += f"- **Total Links:** {stats['total_links']}\n"
+    report += f"- **Average Similarity:** {stats['avg_similarity']}\n"
+    report += f"- **Median Similarity:** {stats['median_similarity']}\n"
+    report += f"- **Standard Deviation:** {stats['std_similarity']}\n"
+    report += f"- **On-Topic Links:** {stats['on_topic']} ({stats['on_topic_rate']}%)\n"
+    report += f"- **Off-Topic Links:** {stats['off_topic']} ({stats['off_topic_rate']}%)\n"
+    report += f"- **Flagged Domains:** {stats['flagged_domains']}/{stats['total_domains']} ({stats['domain_flag_rate']}%)\n\n"
+    
+    # Critical Issues
+    if findings['critical_issues']:
+        report += "## 🚨 Critical Issues\n\n"
+        for issue in findings['critical_issues']:
+            report += f"### {issue['severity']}: {issue['issue']}\n\n"
+            report += f"**Detail:** {issue['detail']}\n"
+            report += f"**Impact:** {issue['impact']}\n\n"
+    
+    # Recommendations
+    report += "## 💡 Recommendations\n\n"
+    for rec in findings['recommendations']:
+        report += f"### [{rec['priority']}] {rec['action']}\n\n"
+        report += f"{rec['detail']}\n\n"
+    
+    # Risk Assessment
+    report += "## ⚠️ Risk Assessment\n\n"
+    risk = findings['risk_assessment']
+    report += f"**Overall Risk Level:** {risk['level']}\n"
+    report += f"**Manual Action Risk:** {risk['manual_action_risk']}\n"
+    report += f"**Penalty Risk:** {risk['penalty_risk']}\n\n"
+    
+    return report
+
+# ==================== ADVANCED VISUALIZATIONS ====================
+
+def create_advanced_similarity_analysis(df: pd.DataFrame):
+    """
+    Create comprehensive similarity analysis visualization
+    """
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('Distribution', 'Box Plot', 'Violin Plot', 'Cumulative Distribution'),
+        specs=[[{"type": "histogram"}, {"type": "box"}],
+               [{"type": "violin"}, {"type": "scatter"}]]
+    )
+    
+    # Histogram
+    fig.add_trace(
+        go.Histogram(x=df['similarity'], nbinsx=30, name='Distribution',
+                    marker_color='#667eea', showlegend=False),
+        row=1, col=1
+    )
+    
+    # Box Plot
+    fig.add_trace(
+        go.Box(y=df['similarity'], name='Box Plot',
+              marker_color='#764ba2', showlegend=False),
+        row=1, col=2
+    )
+    
+    # Violin Plot
+    fig.add_trace(
+        go.Violin(y=df['similarity'], name='Violin Plot',
+                 fillcolor='#38ef7d', line_color='#11998e', showlegend=False),
+        row=2, col=1
+    )
+    
+    # Cumulative Distribution
+    sorted_sim = np.sort(df['similarity'])
+    cumulative = np.arange(1, len(sorted_sim) + 1) / len(sorted_sim) * 100
+    fig.add_trace(
+        go.Scatter(x=sorted_sim, y=cumulative, mode='lines',
+                  name='Cumulative %', line=dict(color='#f5576c', width=3),
+                  showlegend=False),
+        row=2, col=2
+    )
+    
+    fig.update_layout(
+        height=800,
+        title_text="Advanced Similarity Score Analysis",
+        showlegend=False
+    )
+    
+    fig.update_xaxes(title_text="Similarity Score", row=1, col=1)
+    fig.update_xaxes(title_text="Similarity Score", row=2, col=2)
+    fig.update_yaxes(title_text="Frequency", row=1, col=1)
+    fig.update_yaxes(title_text="Similarity Score", row=1, col=2)
+    fig.update_yaxes(title_text="Similarity Score", row=2, col=1)
+    fig.update_yaxes(title_text="Cumulative %", row=2, col=2)
+    
+    return fig
+
+def create_interpretation_sunburst(df: pd.DataFrame):
+    """
+    Create sunburst chart for interpretation breakdown
+    """
+    # Add score ranges
+    df_copy = df.copy()
+    df_copy['score_range'] = pd.cut(
+        df_copy['similarity'],
+        bins=[0, 0.35, 0.56, 0.70, 1.0],
+        labels=['0.00-0.35', '0.36-0.55', '0.56-0.69', '0.70-1.00']
+    )
+    
+    # Create hierarchy data
+    data = df_copy.groupby(['interpretation', 'score_range']).size().reset_index(name='count')
+    
+    fig = px.sunburst(
+        data,
+        path=['interpretation', 'score_range'],
+        values='count',
+        color='interpretation',
+        color_discrete_map={
+            'On-Topic': '#38ef7d',
+            'Borderline': '#ffd93d',
+            'Weak': '#ff9a76',
+            'Off-Topic': '#f5576c'
+        },
+        title="Link Quality Hierarchy"
+    )
+    
+    fig.update_layout(height=600)
+    
+    return fig
+
+def create_domain_treemap(domain_summary: pd.DataFrame):
+    """
+    Create treemap visualization for domain analysis
+    """
+    top_domains = domain_summary.head(20).copy()
+    top_domains['label'] = top_domains['external_domain'] + '<br>' + top_domains['avg_score'].apply(lambda x: f"{x:.3f}")
+    
+    fig = px.treemap(
+        top_domains,
+        path=[px.Constant("All Domains"), 'verdict', 'external_domain'],
+        values='pair_count',
+        color='avg_score',
+        color_continuous_scale='RdYlGn',
+        title="Domain Authority Treemap (Top 20)",
+        hover_data=['pair_count', 'off_topic_rate']
+    )
+    
+    fig.update_layout(height=600)
+    
+    return fig
+
+def create_correlation_heatmap(df: pd.DataFrame):
+    """
+    Create correlation heatmap if there's enough data
+    """
+    # Extract numerical features
+    df_copy = df.copy()
+    df_copy['interp_numeric'] = df_copy['interpretation'].map({
+        'On-Topic': 4,
+        'Borderline': 3,
+        'Weak': 2,
+        'Off-Topic': 1
+    })
+    
+    # Simple correlation matrix
+    corr_data = pd.DataFrame({
+        'Similarity': df_copy['similarity'],
+        'Quality': df_copy['interp_numeric']
+    })
+    
+    corr_matrix = corr_data.corr()
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_matrix.values,
+        x=corr_matrix.columns,
+        y=corr_matrix.columns,
+        colorscale='RdYlGn',
+        text=corr_matrix.values,
+        texttemplate='%{text:.3f}',
+        textfont={"size": 14},
+        colorbar=dict(title="Correlation")
+    ))
+    
+    fig.update_layout(
+        title="Feature Correlation Matrix",
+        height=400
+    )
+    
+    return fig
+
+def create_score_timeline(df: pd.DataFrame):
+    """
+    Create timeline of scores (if timestamp available)
+    """
+    df_copy = df.copy()
+    df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'])
+    df_copy = df_copy.sort_values('timestamp')
+    
+    fig = go.Figure()
+    
+    # Add scatter plot
+    fig.add_trace(go.Scatter(
+        x=df_copy['timestamp'],
+        y=df_copy['similarity'],
+        mode='markers',
+        name='Similarity Scores',
+        marker=dict(
+            size=8,
+            color=df_copy['similarity'],
+            colorscale='RdYlGn',
+            showscale=True,
+            colorbar=dict(title="Similarity")
+        ),
+        text=df_copy['interpretation'],
+        hovertemplate='<b>Time:</b> %{x}<br><b>Similarity:</b> %{y:.3f}<br><b>Type:</b> %{text}<extra></extra>'
+    ))
+    
+    # Add moving average
+    window = min(10, len(df_copy) // 10)
+    if window > 1:
+        df_copy['ma'] = df_copy['similarity'].rolling(window=window).mean()
+        fig.add_trace(go.Scatter(
+            x=df_copy['timestamp'],
+            y=df_copy['ma'],
+            mode='lines',
+            name=f'{window}-Period Moving Average',
+            line=dict(color='#667eea', width=3)
+        ))
+    
+    fig.update_layout(
+        title="Similarity Score Timeline",
+        xaxis_title="Time",
+        yaxis_title="Similarity Score",
+        height=500,
+        hovermode='closest'
+    )
+    
+    return fig
+
+def create_statistical_summary_table(df: pd.DataFrame):
+    """
+    Create detailed statistical summary table
+    """
+    summary_stats = df['similarity'].describe()
+    
+    # Additional statistics
+    skewness = df['similarity'].skew()
+    kurtosis = df['similarity'].kurtosis()
+    q1 = df['similarity'].quantile(0.25)
+    q3 = df['similarity'].quantile(0.75)
+    iqr = q3 - q1
+    
+    summary_data = {
+        'Statistic': ['Count', 'Mean', 'Std Dev', 'Min', '25%', 'Median', '75%', 'Max', 'IQR', 'Skewness', 'Kurtosis'],
+        'Value': [
+            f"{int(summary_stats['count'])}",
+            f"{summary_stats['mean']:.4f}",
+            f"{summary_stats['std']:.4f}",
+            f"{summary_stats['min']:.4f}",
+            f"{q1:.4f}",
+            f"{summary_stats['50%']:.4f}",
+            f"{q3:.4f}",
+            f"{summary_stats['max']:.4f}",
+            f"{iqr:.4f}",
+            f"{skewness:.4f}",
+            f"{kurtosis:.4f}"
+        ]
+    }
+    
+    return pd.DataFrame(summary_data)
+
+
+# ==================== HELPER FUNCTIONS (REST OF PREVIOUS CODE) ====================
 
 def get_similarity_score_bucket(score: float) -> Tuple[str, str]:
-    """Categorize similarity score into buckets"""
     if score >= 0.70:
         return "On-Topic", "score-high"
     elif score >= 0.56:
@@ -448,22 +1078,12 @@ def get_similarity_score_bucket(score: float) -> Tuple[str, str]:
         return "Off-Topic", "score-low"
 
 @st.cache_resource
-def load_similarity_model(model_name: str = "all-MiniLM-L6-v2"):
-    """Load and cache the similarity model"""
-    similarity_client = OfflineSemanticSimilarity(model_name)
-    similarity_client.load_model()
-    return similarity_client
+def load_similarity_model(model_name: str = "all-MiniLM-L6-v2", delay: float = 2.0):
+    client = OfflineSemanticSimilarity(model_name, delay)
+    client.load_model()
+    return client
 
-def run_probe_with_paraphrases(
-    gemini_client: GeminiClient,
-    question: str, 
-    paraphrases: List[str], 
-    url: str,
-    model: str, 
-    temperature: float, 
-    k_runs: int
-) -> Dict:
-    """Run probe with multiple paraphrases and k runs for consistency using Gemini"""
+def run_probe_with_paraphrases(gemini_client, question, paraphrases, url, model, temperature, k_runs):
     all_questions = [question] + paraphrases
     results = {
         'url': url,
@@ -476,39 +1096,18 @@ def run_probe_with_paraphrases(
         'model_used': model
     }
     
-    closed_book_prefix = """Answer this question using ONLY your existing training knowledge. 
-Do NOT simulate browsing or retrieval. If you don't know from your training data, say "I don't have this information in my training data."
+    prefix = """Answer using ONLY existing training knowledge. Do NOT simulate browsing.
+If you don't know, say "I don't have this information."
 
 Question: """
     
-    total_calls = len(all_questions) * k_runs
-    call_count = 0
-    
     for q in all_questions:
-        full_prompt = closed_book_prefix + q
-        
         for run in range(k_runs):
-            call_count += 1
-            logger.info(f"Probe call {call_count}/{total_calls}: {q[:50]}...")
-            
-            response = gemini_client.generate_response(
-                full_prompt,
-                model=model,
-                temperature=temperature
-            )
-            
-            if response:
-                results['responses'][q].append(response)
-            else:
-                results['responses'][q].append("API_ERROR")
-            
+            response = gemini_client.generate_response(prefix + q, model, temperature)
+            results['responses'][q].append(response if response else "API_ERROR")
             time.sleep(0.5)
     
-    # Calculate consistency
-    all_responses = []
-    for q_responses in results['responses'].values():
-        all_responses.extend(q_responses)
-    
+    all_responses = [r for responses in results['responses'].values() for r in responses]
     valid_responses = [r for r in all_responses if r != "API_ERROR"]
     
     if valid_responses:
@@ -516,26 +1115,16 @@ Question: """
         results['consistency_score'] = (most_common[1] / len(valid_responses)) * 100
         results['most_common_answer'] = most_common[0]
         results['paraphrase_robust'] = results['consistency_score'] >= 80
-        
-        results['needs_retrieval'] = gemini_client.check_needs_retrieval(
-            question,
-            results['most_common_answer']
-        )
+        results['needs_retrieval'] = gemini_client.check_needs_retrieval(question, most_common[0])
     else:
         results['most_common_answer'] = "All API calls failed"
         results['needs_retrieval'] = True
     
     return results
 
-def analyze_domain_pattern(
-    df: pd.DataFrame, 
-    min_pairs: int = 3, 
-    off_topic_threshold: float = 0.6,
-    avg_score_threshold: float = 0.45
-) -> pd.DataFrame:
-    """Analyze link patterns by external domain to flag suspect link farms"""
+def analyze_domain_pattern(df, min_pairs=3, off_topic_threshold=0.6, avg_score_threshold=0.45):
     df['external_domain'] = df['external_url'].apply(
-        lambda x: x.split('/')[2] if '://' in x else x.split('/')[0]
+        lambda x: urlparse(x).netloc if '://' in x else x.split('/')[0]
     )
     
     domain_groups = df.groupby('external_domain').agg({
@@ -543,289 +1132,119 @@ def analyze_domain_pattern(
         'interpretation': lambda x: (x == 'Off-Topic').sum()
     }).reset_index()
     
-    domain_groups.columns = [
-        'external_domain', 'avg_score', 'min_score', 
-        'max_score', 'pair_count', 'off_topic_count'
-    ]
+    domain_groups.columns = ['external_domain', 'avg_score', 'min_score', 
+                              'max_score', 'pair_count', 'off_topic_count']
     
-    domain_groups['off_topic_rate'] = (
-        domain_groups['off_topic_count'] / domain_groups['pair_count']
-    )
-    
+    domain_groups['off_topic_rate'] = domain_groups['off_topic_count'] / domain_groups['pair_count']
     domain_groups['flagged'] = (
         (domain_groups['pair_count'] >= min_pairs) &
         (domain_groups['off_topic_rate'] >= off_topic_threshold) &
         (domain_groups['avg_score'] <= avg_score_threshold)
     )
-    
     domain_groups['verdict'] = domain_groups.apply(
-        lambda row: 'SUSPECT LINK FARM' if row['flagged'] else 'OK', 
-        axis=1
+        lambda row: 'SUSPECT LINK FARM' if row['flagged'] else 'OK', axis=1
     )
     
     return domain_groups.sort_values('avg_score')
 
-def generate_markdown_report(probe_results: List[Dict], url: str) -> str:
-    """Generate markdown report for probe results"""
-    report = f"# LLM Model Probing Report\n\n"
-    report += f"**Target URL:** {url}\n"
-    report += f"**Model:** {probe_results[0].get('model_used', 'N/A') if probe_results else 'N/A'}\n"
-    report += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    report += "---\n\n"
+def generate_markdown_report(probe_results, url):
+    report = f"# LLM Model Probing Report\n\n**Target URL:** {url}\n"
+    report += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n"
     
-    for idx, result in enumerate(probe_results, 1):
-        report += f"## Probe {idx}: {result['original_question']}\n\n"
-        report += f"**Consistency Score:** {result['consistency_score']:.1f}%\n"
-        report += f"**Most Common Answer:** {result.get('most_common_answer', 'N/A')}\n"
-        report += f"**Paraphrase Robust:** {'✓ Yes' if result['paraphrase_robust'] else '✗ No'}\n"
-        report += f"**Needs Retrieval:** {'✓ Yes' if result['needs_retrieval'] else '✗ No'}\n\n"
-        
-        if result['paraphrases']:
-            report += "**Paraphrases tested:**\n"
-            for para in result['paraphrases']:
-                report += f"- {para}\n"
-        
-        report += "\n### Response Distribution:\n"
-        for q, responses in result['responses'].items():
-            if q == result['original_question']:
-                report += f"\n**Original Question Responses ({len(responses)} runs):**\n"
-                for i, resp in enumerate(responses, 1):
-                    report += f"{i}. {resp[:100]}...\n"
-        
-        report += "\n---\n\n"
+    for idx, r in enumerate(probe_results, 1):
+        report += f"## Probe {idx}: {r['original_question']}\n\n"
+        report += f"**Consistency:** {r['consistency_score']:.1f}%\n"
+        report += f"**Answer:** {r.get('most_common_answer', 'N/A')}\n\n---\n\n"
     
     return report
 
-def generate_cmseo_findings(domain_summary: pd.DataFrame) -> str:
-    """Generate CMSEO findings report"""
+def generate_cmseo_findings(domain_summary):
     flagged = domain_summary[domain_summary['flagged'] == True]
     
-    report = "# CMSEO Link Authority Findings\n\n"
-    report += f"**Analysis Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    report += f"**Analysis Method:** Offline Semantic Similarity (Sentence Transformers)\n"
-    report += f"**Total Domains Analyzed:** {len(domain_summary)}\n"
-    report += f"**Flagged Domains:** {len(flagged)}\n\n"
-    report += "---\n\n"
-    
-    report += "## Flagging Criteria\n\n"
-    report += "- Minimum 3 pairs from same domain\n"
-    report += "- Off-topic rate ≥ 60%\n"
-    report += "- Average similarity score ≤ 0.45\n\n"
-    report += "---\n\n"
+    report = f"# CMSEO Link Authority Findings\n\n"
+    report += f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    report += f"**Domains:** {len(domain_summary)}\n"
+    report += f"**Flagged:** {len(flagged)}\n\n---\n\n"
     
     if len(flagged) > 0:
-        report += "## Suspect Link Farms Identified\n\n"
+        report += "## Suspect Link Farms\n\n"
         for _, row in flagged.iterrows():
-            report += f"### {row['external_domain']}\n\n"
-            report += f"- **Average Score:** {row['avg_score']:.3f}\n"
-            report += f"- **Score Range:** {row['min_score']:.3f} - {row['max_score']:.3f}\n"
-            report += f"- **Off-Topic Rate:** {row['off_topic_rate']:.1%}\n"
-            report += f"- **Total Pairs:** {int(row['pair_count'])}\n"
-            report += f"- **Off-Topic Count:** {int(row['off_topic_count'])}\n"
-            report += f"- **Verdict:** 🚨 {row['verdict']}\n\n"
-            report += "**Recommendation:** Consider removing or devaluing links from this domain.\n\n"
-    else:
-        report += "## ✓ No Suspect Domains Found\n\n"
-        report += "All analyzed domains meet quality thresholds.\n\n"
-    
-    report += "---\n\n"
-    report += "## Summary Statistics\n\n"
-    report += f"- **Best Domain Score:** {domain_summary['avg_score'].max():.3f}\n"
-    report += f"- **Worst Domain Score:** {domain_summary['avg_score'].min():.3f}\n"
-    report += f"- **Average Domain Score:** {domain_summary['avg_score'].mean():.3f}\n"
-    report += f"- **Median Domain Score:** {domain_summary['avg_score'].median():.3f}\n"
+            report += f"### {row['external_domain']}\n"
+            report += f"- Avg: {row['avg_score']:.3f}\n"
+            report += f"- Off-Topic: {row['off_topic_rate']:.1%}\n\n"
     
     return report
 
-# ==================== VISUALIZATION FUNCTIONS ====================
-
-def create_consistency_chart(probe_results: List[Dict]) -> go.Figure:
-    """Create consistency score visualization"""
+def create_consistency_chart(probe_results):
     if not probe_results:
         return go.Figure()
     
-    questions = [
-        r['original_question'][:50] + "..." if len(r['original_question']) > 50 
-        else r['original_question'] 
-        for r in probe_results
-    ]
-    consistency_scores = [r['consistency_score'] for r in probe_results]
-    colors = [
-        '#38ef7d' if s >= 80 else '#ffd93d' if s >= 60 else '#f5576c' 
-        for s in consistency_scores
-    ]
+    questions = [r['original_question'][:50] + "..." for r in probe_results]
+    scores = [r['consistency_score'] for r in probe_results]
+    colors = ['#38ef7d' if s >= 80 else '#ffd93d' if s >= 60 else '#f5576c' for s in scores]
     
-    fig = go.Figure(data=[
-        go.Bar(
-            x=consistency_scores,
-            y=questions,
-            orientation='h',
-            marker=dict(
-                color=colors,
-                line=dict(color='rgba(0,0,0,0.3)', width=2)
-            ),
-            text=[f"{s:.1f}%" for s in consistency_scores],
-            textposition='outside',
-            hovertemplate='<b>%{y}</b><br>Consistency: %{x:.1f}%<extra></extra>'
-        )
-    ])
-    
-    fig.update_layout(
-        title="Response Consistency Across Runs",
-        xaxis_title="Consistency Score (%)",
-        yaxis_title="Question",
-        height=max(400, len(probe_results) * 80),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(size=12),
-        xaxis=dict(range=[0, 105]),
-        showlegend=False
-    )
-    
-    return fig
-
-def create_similarity_distribution(df: pd.DataFrame) -> go.Figure:
-    """Create similarity score distribution"""
-    fig = go.Figure()
-    
-    fig.add_trace(go.Histogram(
-        x=df['similarity'],
-        nbinsx=20,
-        marker=dict(
-            color='#667eea',
-            line=dict(color='white', width=1)
-        ),
-        name='Similarity Scores',
-        hovertemplate='Score Range: %{x}<br>Count: %{y}<extra></extra>'
-    ))
-    
-    fig.add_vline(
-        x=0.35, line_dash="dash", line_color="red", line_width=2,
-        annotation_text="Off-Topic Threshold (0.35)",
-        annotation_position="top"
-    )
-    fig.add_vline(
-        x=0.70, line_dash="dash", line_color="green", line_width=2,
-        annotation_text="On-Topic Threshold (0.70)",
-        annotation_position="top"
-    )
-    
-    fig.update_layout(
-        title="Similarity Score Distribution",
-        xaxis_title="Similarity Score",
-        yaxis_title="Frequency",
-        showlegend=False,
-        height=400,
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)'
-    )
-    
-    return fig
-
-def create_domain_comparison(domain_summary: pd.DataFrame) -> go.Figure:
-    """Create domain comparison chart"""
-    top_domains = domain_summary.head(15)
-    
-    colors = [
-        '#f5576c' if flagged else '#38ef7d' 
-        for flagged in top_domains['flagged']
-    ]
-    
-    fig = go.Figure()
-    
-    fig.add_trace(go.Bar(
-        x=top_domains['avg_score'],
-        y=top_domains['external_domain'],
-        orientation='h',
-        marker=dict(
-            color=colors,
-            line=dict(color='rgba(0,0,0,0.3)', width=1)
-        ),
-        text=[f"{s:.3f}" for s in top_domains['avg_score']],
-        textposition='outside',
-        hovertemplate='<b>%{y}</b><br>Avg Score: %{x:.3f}<extra></extra>'
-    ))
-    
-    fig.update_layout(
-        title="Domain Authority Scores (Bottom 15)",
-        xaxis_title="Average Similarity Score",
-        yaxis_title="External Domain",
-        height=max(400, len(top_domains) * 40),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        showlegend=False
-    )
-    
-    return fig
-
-def create_interpretation_pie(df: pd.DataFrame) -> go.Figure:
-    """Create interpretation bucket pie chart"""
-    bucket_counts = df['interpretation'].value_counts()
-    
-    colors = {
-        'On-Topic': '#38ef7d',
-        'Borderline': '#ffd93d',
-        'Weak': '#ff9a76',
-        'Off-Topic': '#f5576c'
-    }
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=bucket_counts.index,
-        values=bucket_counts.values,
-        marker=dict(
-            colors=[colors.get(label, '#cccccc') for label in bucket_counts.index]
-        ),
-        textinfo='label+percent+value',
-        textfont=dict(size=14),
-        hole=0.4,
-        hovertemplate='<b>%{label}</b><br>Count: %{value}<br>Percentage: %{percent}<extra></extra>'
+    fig = go.Figure(data=[go.Bar(
+        x=scores, y=questions, orientation='h',
+        marker=dict(color=colors),
+        text=[f"{s:.1f}%" for s in scores],
+        textposition='outside'
     )])
     
     fig.update_layout(
-        title="Link Quality Distribution",
-        height=400,
-        showlegend=True,
-        paper_bgcolor='rgba(0,0,0,0)'
+        title="Response Consistency",
+        xaxis_title="Consistency (%)",
+        height=max(400, len(probe_results) * 80),
+        showlegend=False
     )
     
     return fig
 
-def create_heatmap_analysis(df: pd.DataFrame) -> go.Figure:
-    """Create heatmap of similarity scores"""
-    if len(df) == 0:
-        return go.Figure()
+def create_similarity_distribution(df):
+    fig = go.Figure(data=[go.Histogram(
+        x=df['similarity'], nbinsx=20,
+        marker=dict(color='#667eea')
+    )])
     
-    df['external_short'] = df['external_url'].apply(
-        lambda x: x.split('/')[2] if '://' in x else x[:30]
-    )
-    df['target_short'] = df['target_url'].apply(
-        lambda x: '/'.join(x.split('/')[-2:]) if '/' in x else x[:20]
-    )
-    
-    pivot = df.pivot_table(
-        values='similarity', 
-        index='external_short', 
-        columns='target_short', 
-        aggfunc='mean'
-    )
-    
-    fig = go.Figure(data=go.Heatmap(
-        z=pivot.values,
-        x=pivot.columns,
-        y=pivot.index,
-        colorscale='RdYlGn',
-        text=np.round(pivot.values, 3),
-        texttemplate='%{text}',
-        textfont={"size": 10},
-        colorbar=dict(title="Similarity"),
-        hovertemplate='External: %{y}<br>Target: %{x}<br>Similarity: %{z:.3f}<extra></extra>'
-    ))
+    fig.add_vline(x=0.35, line_dash="dash", line_color="red")
+    fig.add_vline(x=0.70, line_dash="dash", line_color="green")
     
     fig.update_layout(
-        title="Similarity Heatmap: External vs Target URLs",
-        height=max(400, len(pivot) * 30),
-        xaxis_title="Target URL",
-        yaxis_title="External Domain"
+        title="Similarity Distribution",
+        xaxis_title="Similarity",
+        yaxis_title="Frequency",
+        height=400
+    )
+    
+    return fig
+
+def create_interpretation_pie(df):
+    counts = df['interpretation'].value_counts()
+    colors = {'On-Topic': '#38ef7d', 'Borderline': '#ffd93d', 
+              'Weak': '#ff9a76', 'Off-Topic': '#f5576c'}
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=counts.index, values=counts.values,
+        marker=dict(colors=[colors.get(l, '#ccc') for l in counts.index]),
+        hole=0.4
+    )])
+    
+    fig.update_layout(title="Link Quality Distribution", height=400)
+    return fig
+
+def create_domain_comparison(domain_summary):
+    top = domain_summary.head(15)
+    colors = ['#f5576c' if f else '#38ef7d' for f in top['flagged']]
+    
+    fig = go.Figure(data=[go.Bar(
+        x=top['avg_score'], y=top['external_domain'],
+        orientation='h', marker=dict(color=colors),
+        text=[f"{s:.3f}" for s in top['avg_score']]
+    )])
+    
+    fig.update_layout(
+        title="Domain Authority Scores",
+        xaxis_title="Avg Similarity",
+        height=max(400, len(top) * 40)
     )
     
     return fig
@@ -833,884 +1252,562 @@ def create_heatmap_analysis(df: pd.DataFrame) -> go.Figure:
 # ==================== MAIN APPLICATION ====================
 
 def main():
-    # Header
-    st.markdown(
-        '<h1 class="main-header">🔍 LLM Model Probing & Link Authority Dashboard</h1>', 
-        unsafe_allow_html=True
-    )
+    st.markdown('<h1 class="main-header">🔍 LLM Model Probing & Link Authority Dashboard</h1>', 
+                unsafe_allow_html=True)
     
     st.markdown("""
     <div class="info-box">
-        <strong>📊 Production Dashboard (Offline Mode):</strong> 
+        <strong>🚀 Production Dashboard with Advanced Analytics:</strong>
         <ul>
-            <li><strong>Model Probing:</strong> Test LLM knowledge with Google Gemini API (closed-book evaluation)</li>
-            <li><strong>Link Authority:</strong> Analyze semantic similarity using <strong>offline Sentence Transformers</strong></li>
-            <li><strong>Domain Analysis:</strong> Identify suspect link farms and off-authority patterns</li>
+            <li><strong>Model Probing:</strong> Test Gemini's knowledge with closed-book evaluation</li>
+            <li><strong>Link Authority:</strong> Semantic similarity with rate limiting (Sequential processing)</li>
+            <li><strong>Advanced Visualizations:</strong> Sunburst, treemap, correlation, timeline charts</li>
+            <li><strong>Key Findings:</strong> Automated risk assessment and recommendations</li>
         </ul>
-        <p><strong>✨ No external API needed for similarity analysis!</strong></p>
     </div>
     """, unsafe_allow_html=True)
     
-    # ==================== SIDEBAR CONFIGURATION ====================
+    # Sidebar (same as before with minor adjustments)
     with st.sidebar:
-        st.markdown("### ⚙️ API Configuration")
+        st.markdown("### ⚙️ Configuration")
         
-        # Gemini API Configuration
-        st.markdown("#### 🤖 Google Gemini API")
-        gemini_api_key = st.text_input(
-            "Gemini API Key",
-            type="password",
-            value=st.session_state.gemini_api_key,
-            help="Get your API key from https://aistudio.google.com/app/apikey"
-        )
-        
-        if gemini_api_key != st.session_state.gemini_api_key:
-            st.session_state.gemini_api_key = gemini_api_key
+        st.markdown("#### 🤖 Google Gemini")
+        gemini_key = st.text_input("Gemini API Key", type="password", 
+                                   value=st.session_state.gemini_api_key, key="sidebar_gemini_key")
+        if gemini_key != st.session_state.gemini_api_key:
+            st.session_state.gemini_api_key = gemini_key
         
         gemini_client = GeminiClient(st.session_state.gemini_api_key)
         
         if gemini_client.is_connected:
-            st.markdown(
-                '<div class="api-status api-connected">✓ Gemini Connected</div>',
-                unsafe_allow_html=True
-            )
+            st.markdown('<div class="api-status api-connected">✓ Connected</div>', unsafe_allow_html=True)
         else:
-            st.markdown(
-                '<div class="api-status api-disconnected">✗ Gemini Disconnected</div>',
-                unsafe_allow_html=True
-            )
+            st.markdown('<div class="api-status api-disconnected">✗ Disconnected</div>', unsafe_allow_html=True)
         
         st.markdown("---")
         
-        # Offline Semantic Similarity Configuration
-        st.markdown("#### 🤖 Offline Semantic Similarity")
-        
-        similarity_model_options = {
-            "all-MiniLM-L6-v2 (Fast, 80MB)": "all-MiniLM-L6-v2",
-            "all-mpnet-base-v2 (Accurate, 420MB)": "all-mpnet-base-v2",
-            "paraphrase-MiniLM-L6-v2 (Balanced, 80MB)": "paraphrase-MiniLM-L6-v2",
+        st.markdown("#### 🤖 Semantic Similarity")
+        model_options = {
+            "all-MiniLM-L6-v2 (Fast)": "all-MiniLM-L6-v2",
+            "all-mpnet-base-v2 (Accurate)": "all-mpnet-base-v2",
         }
+        selected = st.selectbox("Model", list(model_options.keys()), key="sidebar_model_select")
+        model_name = model_options[selected]
         
-        selected_model_display = st.selectbox(
-            "Embedding Model",
-            options=list(similarity_model_options.keys()),
-            help="Choose embedding model for semantic similarity"
-        )
-        selected_model = similarity_model_options[selected_model_display]
+        delay = st.slider("Delay Between Requests (seconds)", 1.0, 10.0, 2.0, 0.5, key="sidebar_delay",
+                         help="Increase to avoid IP blocking")
         
-        if st.button("🔄 Load Similarity Model", use_container_width=True):
-            with st.spinner("Loading model... This may take a minute on first run..."):
-                similarity_client = load_similarity_model(selected_model)
-                st.session_state.similarity_model = similarity_client
-                st.session_state.similarity_model_loaded = similarity_client.is_loaded
-                if similarity_client.is_loaded:
-                    st.success("✅ Model loaded successfully!")
+        if st.button("🔄 Load Model", use_container_width=True, key="sidebar_load_model"):
+            with st.spinner("Loading..."):
+                sim_client = load_similarity_model(model_name, delay)
+                st.session_state.similarity_model = sim_client
+                st.session_state.similarity_model_loaded = sim_client.is_loaded
+                if sim_client.is_loaded:
+                    st.success("✅ Loaded!")
                 else:
-                    st.error("❌ Failed to load model")
+                    st.error("❌ Failed")
         
         if st.session_state.similarity_model_loaded:
-            st.markdown(
-                f'<div class="api-status api-connected">✓ Model Loaded: {selected_model}</div>',
-                unsafe_allow_html=True
-            )
+            st.markdown('<div class="api-status api-connected">✓ Model Loaded</div>', unsafe_allow_html=True)
         else:
-            st.markdown(
-                '<div class="api-status api-disconnected">✗ Model Not Loaded</div>',
-                unsafe_allow_html=True
-            )
+            st.markdown('<div class="api-status api-disconnected">✗ Not Loaded</div>', unsafe_allow_html=True)
         
         st.markdown("---")
         
-        # Model Selection
-        st.markdown("### 🤖 LLM Configuration")
-        model_choice = st.selectbox(
-            "Gemini Model",
-            [
-                "gemini-2.0-flash-exp",
-                "gemini-1.5-flash",
-                "gemini-1.5-pro",
-                "gemini-1.5-flash-8b"
-            ],
-            help="Select Gemini model for probing"
-        )
-        
-        temperature = st.slider(
-            "Temperature",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.1,
-            step=0.1,
-            help="Lower temperature = more consistent responses"
-        )
-        
-        k_runs = st.number_input(
-            "Consistency Runs (k)",
-            min_value=1,
-            max_value=10,
-            value=3,
-            help="Number of times to run each probe"
-        )
+        st.markdown("### ⚙️ Settings")
+        model_choice = st.selectbox("Gemini Model", 
+            ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-pro"], key="sidebar_gemini_model")
+        temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.1, key="sidebar_temperature")
+        k_runs = st.number_input("Consistency Runs", 1, 10, 3, key="sidebar_k_runs")
         
         st.markdown("---")
         
-        # Link Analysis Configuration
-        st.markdown("### 🔗 Link Analysis Config")
-        min_pairs = st.number_input(
-            "Min Pairs for Pattern",
-            min_value=1,
-            max_value=10,
-            value=3,
-            help="Minimum pairs needed to flag a domain"
-        )
-        
-        off_topic_threshold = st.slider(
-            "Off-Topic Threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.6,
-            step=0.05,
-            help="Minimum off-topic rate to flag"
-        )
-        
-        avg_score_threshold = st.slider(
-            "Avg Score Threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.45,
-            step=0.05,
-            help="Maximum avg score to flag"
-        )
+        st.markdown("### 🔗 Link Analysis")
+        min_pairs = st.number_input("Min Pairs", 1, 10, 3, key="sidebar_min_pairs")
+        off_topic_threshold = st.slider("Off-Topic Threshold", 0.0, 1.0, 0.6, 0.05, key="sidebar_off_topic")
+        avg_score_threshold = st.slider("Avg Score Threshold", 0.0, 1.0, 0.45, 0.05, key="sidebar_avg_score")
         
         st.markdown("---")
         
-        if st.button("🗑️ Clear All Data", use_container_width=True):
+        if st.button("🗑️ Clear Data", use_container_width=True, key="sidebar_clear"):
             st.session_state.probe_results = []
             st.session_state.link_analysis_results = []
             st.session_state.domain_summary = {}
             st.rerun()
     
-    # ==================== MAIN TABS ====================
-    tab1, tab2, tab3, tab4 = st.tabs([
+    # Main tabs - ENHANCED with new tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🧪 Model Probing",
-        "🔗 Link Authority Analysis (Offline)",
-        "📊 Domain Patterns",
+        "🔗 Link Authority",
+        "📊 Advanced Visualizations",
+        "🔍 Key Findings",
         "📈 Analytics Dashboard"
     ])
     
-    # ==================== TAB 1: MODEL PROBING ====================
+    # TAB 1: Model Probing (same as before)
     with tab1:
-        st.markdown('<h2 class="sub-header">LLM Model Probing with Google Gemini</h2>', 
-                    unsafe_allow_html=True)
+        st.markdown('<h2 class="sub-header">Model Probing</h2>', unsafe_allow_html=True)
         
         if not gemini_client.is_connected:
-            st.error("⚠️ Gemini API not connected. Please configure API key in sidebar.")
-        
-        st.markdown("""
-        <div class="info-box">
-            <strong>🎯 Closed-Book Testing:</strong> Evaluate what Gemini already knows about specific 
-            pages without allowing web browsing or retrieval. Test consistency across multiple runs 
-            and paraphrases.
-        </div>
-        """, unsafe_allow_html=True)
+            st.error("⚠️ Gemini not connected")
         
         col1, col2 = st.columns([2, 1])
-        
         with col1:
-            target_url = st.text_input(
-                "Target URL (e.g., Stake Blackjack page)",
-                placeholder="https://stake.com/casino/games/blackjack",
-                help="The page you want to probe the LLM's knowledge about"
-            )
-        
+            target_url = st.text_input("Target URL", key="probe_target_url")
         with col2:
-            page_name = st.text_input(
-                "Page Name",
-                placeholder="Main Blackjack",
-                help="Short identifier for this page"
-            )
+            page_name = st.text_input("Page Name", key="probe_page_name")
         
-        st.markdown("#### Define Atomic Facts to Probe")
-        
-        num_questions = st.number_input(
-            "Number of Facts to Probe",
-            min_value=1,
-            max_value=10,
-            value=3,
-            help="How many atomic facts do you want to test?"
-        )
+        num_questions = st.number_input("Number of Facts", 1, 10, 3, key="probe_num_questions")
         
         questions_data = []
         for i in range(num_questions):
             with st.expander(f"📝 Fact #{i+1}", expanded=(i==0)):
-                col_q1, col_q2 = st.columns([3, 2])
+                main_q = st.text_area(f"Question {i+1}", key=f"probe_q_{i}", height=80)
+                expected = st.text_input("Expected Answer", key=f"probe_exp_{i}")
                 
-                with col_q1:
-                    main_q = st.text_area(
-                        f"Main Question",
-                        placeholder="From your existing knowledge only, what blackjack payout is stated on Stake's main blackjack page?",
-                        key=f"main_q_{i}",
-                        height=100
-                    )
-                
-                with col_q2:
-                    expected = st.text_input(
-                        "Expected Answer (optional)",
-                        placeholder="3:2",
-                        key=f"expected_{i}"
-                    )
-                
-                st.markdown("**Paraphrases (for robustness testing):**")
                 col_p1, col_p2 = st.columns(2)
-                
                 with col_p1:
-                    para1 = st.text_input(
-                        "Paraphrase 1",
-                        placeholder="State the blackjack payout ratio Stake highlights",
-                        key=f"para1_{i}"
-                    )
-                
+                    para1 = st.text_input("Paraphrase 1", key=f"probe_p1_{i}")
                 with col_p2:
-                    para2 = st.text_input(
-                        "Paraphrase 2",
-                        placeholder="What's the blackjack payout mentioned on Stake?",
-                        key=f"para2_{i}"
-                    )
+                    para2 = st.text_input("Paraphrase 2", key=f"probe_p2_{i}")
                 
                 if main_q:
-                    paraphrases = [p for p in [para1, para2] if p]
                     questions_data.append({
                         'main': main_q,
-                        'paraphrases': paraphrases,
+                        'paraphrases': [p for p in [para1, para2] if p],
                         'expected': expected
                     })
         
-        st.markdown("---")
-        
-        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
-        
-        with col_btn1:
-            run_probe = st.button("🚀 Run Probe", use_container_width=True, type="primary")
-        
-        with col_btn2:
-            if st.session_state.probe_results:
-                clear_probe = st.button("Clear Results", use_container_width=True)
-                if clear_probe:
-                    st.session_state.probe_results = []
-                    st.rerun()
-        
-        if run_probe:
-            if not gemini_client.is_connected:
-                st.error("❌ Gemini API not connected. Please configure in sidebar.")
-            elif not target_url or not questions_data:
-                st.error("❌ Please provide target URL and at least one question.")
-            else:
-                with st.spinner("🔄 Running probes with Gemini API... This may take a few minutes..."):
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+        if st.button("🚀 Run Probe", type="primary", key="probe_run_button"):
+            if gemini_client.is_connected and target_url and questions_data:
+                with st.spinner("Running probes..."):
+                    progress = st.progress(0)
                     results = []
                     
                     for idx, q_data in enumerate(questions_data):
-                        status_text.text(f"Probing fact {idx + 1}/{len(questions_data)}...")
-                        
                         result = run_probe_with_paraphrases(
-                            gemini_client,
-                            q_data['main'],
-                            q_data['paraphrases'],
-                            target_url,
-                            model_choice,
-                            temperature,
-                            k_runs
+                            gemini_client, q_data['main'], q_data['paraphrases'],
+                            target_url, model_choice, temperature, k_runs
                         )
                         result['expected'] = q_data['expected']
                         result['page_name'] = page_name
                         results.append(result)
-                        
-                        progress_bar.progress((idx + 1) / len(questions_data))
+                        progress.progress((idx + 1) / len(questions_data))
                     
                     st.session_state.probe_results = results
-                    status_text.text("")
                     st.success(f"✅ Completed {len(results)} probes!")
                     st.rerun()
+            else:
+                st.error("❌ Check configuration")
         
-        # Display Results (same as before - keeping code concise)
         if st.session_state.probe_results:
             st.markdown("---")
-            st.markdown("### 📊 Probe Results")
+            st.markdown("### 📊 Results")
             
             results = st.session_state.probe_results
-            avg_consistency = np.mean([r['consistency_score'] for r in results])
-            robust_count = sum([r['paraphrase_robust'] for r in results])
-            needs_retrieval_count = sum([r['needs_retrieval'] for r in results])
+            avg_cons = np.mean([r['consistency_score'] for r in results])
+            robust = sum([r['paraphrase_robust'] for r in results])
+            needs_ret = sum([r['needs_retrieval'] for r in results])
             
-            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.markdown(f'<div class="metric-card"><h3>{len(results)}</h3><p>Probes</p></div>', unsafe_allow_html=True)
+            with col2:
+                st.markdown(f'<div class="metric-card"><h3>{avg_cons:.1f}%</h3><p>Avg Consistency</p></div>', unsafe_allow_html=True)
+            with col3:
+                st.markdown(f'<div class="success-card"><h3>{robust}/{len(results)}</h3><p>Robust</p></div>', unsafe_allow_html=True)
+            with col4:
+                st.markdown(f'<div class="warning-card"><h3>{needs_ret}</h3><p>Need Retrieval</p></div>', unsafe_allow_html=True)
             
-            with metric_col1:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3 style="margin:0; font-size:2rem;">{len(results)}</h3>
-                    <p style="margin:0;">Total Probes</p>
-                </div>
-                """, unsafe_allow_html=True)
+            fig = create_consistency_chart(results)
+            st.plotly_chart(fig, use_container_width=True)
             
-            with metric_col2:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3 style="margin:0; font-size:2rem;">{avg_consistency:.1f}%</h3>
-                    <p style="margin:0;">Avg Consistency</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with metric_col3:
-                card_class = "success-card" if robust_count == len(results) else "warning-card"
-                st.markdown(f"""
-                <div class="{card_class}">
-                    <h3 style="margin:0; font-size:2rem;">{robust_count}/{len(results)}</h3>
-                    <p style="margin:0;">Paraphrase Robust</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with metric_col4:
-                card_class = "warning-card" if needs_retrieval_count > 0 else "success-card"
-                st.markdown(f"""
-                <div class="{card_class}">
-                    <h3 style="margin:0; font-size:2rem;">{needs_retrieval_count}</h3>
-                    <p style="margin:0;">Need Retrieval</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            st.markdown("<br>", unsafe_allow_html=True)
-            
-            fig_consistency = create_consistency_chart(results)
-            st.plotly_chart(fig_consistency, use_container_width=True)
-            
-            st.markdown("#### 📋 Detailed Results")
-            
-            for idx, r in enumerate(results, 1):
-                with st.expander(f"Probe {idx}: {r['original_question'][:60]}...", expanded=(idx==1)):
-                    col_detail1, col_detail2, col_detail3 = st.columns(3)
-                    
-                    with col_detail1:
-                        st.metric("Consistency", f"{r['consistency_score']:.1f}%")
-                    with col_detail2:
-                        st.metric("Paraphrase Robust", "✓ Yes" if r['paraphrase_robust'] else "✗ No")
-                    with col_detail3:
-                        st.metric("Needs Retrieval", "✓ Yes" if r['needs_retrieval'] else "✗ No")
-                    
-                    st.markdown("**Most Common Answer:**")
-                    st.info(r.get('most_common_answer', 'N/A'))
-                    
-                    if r.get('expected'):
-                        st.markdown(f"**Expected Answer:** {r['expected']}")
-                    
-                    st.markdown("**All Responses:**")
-                    for q, responses in r['responses'].items():
-                        st.markdown(f"*Question variant:* {q[:80]}...")
-                        for i, resp in enumerate(responses, 1):
-                            st.text(f"  Run {i}: {resp[:150]}{'...' if len(resp) > 150 else ''}")
-            
-            # Download Options
-            st.markdown("#### 💾 Export Results")
-            col_dl1, col_dl2 = st.columns(2)
-            
-            with col_dl1:
-                if target_url:
-                    report_md = generate_markdown_report(results, target_url)
-                    st.download_button(
-                        label="📄 Download Report (Markdown)",
-                        data=report_md,
-                        file_name=f"probe_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-                        mime="text/markdown",
-                        use_container_width=True
-                    )
-            
-            with col_dl2:
-                results_df = pd.DataFrame([{
-                    'Question': r['original_question'],
-                    'Most Common Answer': r.get('most_common_answer', 'N/A'),
-                    'Expected': r.get('expected', 'N/A'),
-                    'Consistency': f"{r['consistency_score']:.1f}%",
-                    'Robust': r['paraphrase_robust'],
-                    'Needs Retrieval': r['needs_retrieval'],
-                    'Model': r.get('model_used', 'N/A')
-                } for r in results])
-                
-                csv = results_df.to_csv(index=False)
-                st.download_button(
-                    label="📊 Download Results (CSV)",
-                    data=csv,
-                    file_name=f"probe_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+            report = generate_markdown_report(results, target_url)
+            st.download_button("📄 Download Report", report, 
+                             f"probe_report_{datetime.now().strftime('%Y%m%d')}.md",
+                             key="probe_download_report")
     
-    # ==================== TAB 2: LINK AUTHORITY ANALYSIS (OFFLINE) ====================
+    # TAB 2: Link Authority (same structure but enhanced display)
     with tab2:
-        st.markdown('<h2 class="sub-header">Link Authority Analysis (Offline Mode)</h2>', 
-                    unsafe_allow_html=True)
+        st.markdown('<h2 class="sub-header">Link Authority (Sequential Processing)</h2>', unsafe_allow_html=True)
         
         if not st.session_state.similarity_model_loaded:
-            st.error("⚠️ Similarity model not loaded. Please load the model in the sidebar first.")
+            st.error("⚠️ Load model first")
         
-        st.markdown("""
+        st.markdown(f"""
         <div class="info-box">
-            <strong>🔗 Offline Semantic Similarity:</strong> Analyze the topical alignment between 
-            external linking pages and your target pages using local Sentence Transformer models.
-            <strong>No external API required!</strong>
+            <strong>🚀 Sequential Processing:</strong> Rate-limited extraction with {delay}s delays to avoid IP blocking.
+            Includes encoding error handling for international characters.
         </div>
         """, unsafe_allow_html=True)
         
-        analysis_mode = st.radio(
-            "Analysis Mode",
-            ["Single Pair Check", "Bulk Analysis (CSV Upload)"],
-            horizontal=True
-        )
+        mode = st.radio("Mode", ["Single Pair", "Bulk CSV"], horizontal=True, key="link_mode")
         
-        if analysis_mode == "Single Pair Check":
-            st.markdown("#### 🔍 Single Pair Analysis")
-            
+        if mode == "Single Pair":
             col1, col2 = st.columns(2)
-            
             with col1:
-                external_url_single = st.text_input(
-                    "External URL (Linking Page)",
-                    placeholder="https://example.com/casino-reviews",
-                    help="The page that links to your content"
-                )
-            
+                ext_url = st.text_input("External URL", key="link_ext_url")
             with col2:
-                target_url_single = st.text_input(
-                    "Target URL (Your Page)",
-                    placeholder="https://stake.com/casino/games/blackjack",
-                    help="Your page being linked to"
-                )
+                tgt_url = st.text_input("Target URL", key="link_tgt_url")
             
-            if st.button("🚀 Analyze Pair", use_container_width=True, type="primary"):
-                if not st.session_state.similarity_model_loaded:
-                    st.error("❌ Similarity model not loaded. Please load model in sidebar.")
-                elif not external_url_single or not target_url_single:
-                    st.error("❌ Please provide both URLs")
-                else:
-                    with st.spinner("🔄 Analyzing semantic similarity offline..."):
-                        similarity_client = st.session_state.similarity_model
-                        result = similarity_client.get_similarity(
-                            external_url_single,
-                            target_url_single
-                        )
+            if st.button("🚀 Analyze", key="link_analyze_button"):
+                if st.session_state.similarity_model_loaded and ext_url and tgt_url:
+                    with st.spinner("Analyzing..."):
+                        sim_client = st.session_state.similarity_model
+                        result = sim_client.get_similarity(ext_url, tgt_url)
                         
                         if result:
                             col_r1, col_r2, col_r3 = st.columns(3)
-                            
                             with col_r1:
-                                st.metric("Similarity Score", f"{result['similarity']:.3f}")
-                            
+                                st.metric("Similarity", f"{result['similarity']:.3f}")
                             with col_r2:
-                                bucket, badge_class = get_similarity_score_bucket(result['similarity'])
-                                st.markdown(f"""
-                                <div class="score-badge {badge_class}">
-                                    {bucket}
-                                </div>
-                                """, unsafe_allow_html=True)
-                            
+                                bucket, _ = get_similarity_score_bucket(result['similarity'])
+                                st.markdown(f'<div class="info-card">{bucket}</div>', unsafe_allow_html=True)
                             with col_r3:
-                                if result['similarity'] <= 0.45:
-                                    st.markdown('<div class="warning-card">⚠️ OFF-AUTHORITY</div>', 
-                                              unsafe_allow_html=True)
-                                else:
-                                    st.markdown('<div class="success-card">✓ ACCEPTABLE</div>', 
-                                              unsafe_allow_html=True)
+                                verdict = "⚠️ OFF" if result['similarity'] <= 0.45 else "✓ OK"
+                                st.markdown(f'<div class="success-card">{verdict}</div>', unsafe_allow_html=True)
                             
-                            st.markdown("#### 📊 Detailed Analysis")
                             st.json(result)
-                            
-                            if 'single_results' not in st.session_state:
-                                st.session_state.single_results = []
-                            st.session_state.single_results.append(result)
-                            
-                            st.success("✅ Analysis complete!")
                         else:
-                            st.error("❌ Analysis failed. Check logs for details.")
+                            st.error("❌ Failed")
+                else:
+                    st.error("❌ Check config")
         
-        else:  # Bulk Analysis
-            st.markdown("#### 📤 Bulk CSV Upload")
+        else:  # Bulk
+            st.markdown("#### 📤 Bulk Upload")
             
-            st.markdown("""
-            <div class="info-box">
-                <strong>CSV Format Required:</strong>
-                <ul>
-                    <li>Header: <code>external_url,target_url</code></li>
-                    <li>Each row = one pair to analyze</li>
-                    <li>Full URLs required</li>
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            if st.button("📥 Generate Sample CSV Template"):
-                sample_data = pd.DataFrame({
-                    'external_url': [
-                        'https://en.wikipedia.org/wiki/Casino',
-                        'https://en.wikipedia.org/wiki/Blackjack',
-                        'https://en.wikipedia.org/wiki/Poker'
-                    ],
-                    'target_url': [
-                        'https://en.wikipedia.org/wiki/Gambling',
-                        'https://en.wikipedia.org/wiki/Card_game',
-                        'https://en.wikipedia.org/wiki/Texas_hold_em'
-                    ]
+            if st.button("📥 Template", key="link_download_template"):
+                template = pd.DataFrame({
+                    'external_url': ['https://example.com/page1'],
+                    'target_url': ['https://target.com/page1']
                 })
-                csv = sample_data.to_csv(index=False)
-                st.download_button(
-                    label="Download pairs_sample.csv",
-                    data=csv,
-                    file_name="pairs_sample.csv",
-                    mime="text/csv"
-                )
+                csv = template.to_csv(index=False)
+                st.download_button("Download template", csv, "pairs_template.csv", 
+                                 key="link_download_template_file")
             
-            uploaded_file = st.file_uploader(
-                "Upload pairs.csv",
-                type=['csv'],
-                help="CSV file with external_url and target_url columns"
-            )
+            uploaded = st.file_uploader("Upload pairs.csv", type=['csv'], key="link_file_uploader")
             
-            if uploaded_file:
+            if uploaded:
                 try:
-                    pairs_df = pd.read_csv(uploaded_file)
+                    pairs_df = pd.read_csv(uploaded)
                     
                     if 'external_url' not in pairs_df.columns or 'target_url' not in pairs_df.columns:
                         st.error("❌ CSV must have 'external_url' and 'target_url' columns")
                     else:
                         st.success(f"✅ Loaded {len(pairs_df)} pairs")
-                        st.dataframe(pairs_df.head(10), use_container_width=True)
+                        st.dataframe(pairs_df.head(10))
                         
-                        if st.button("🚀 Run Bulk Analysis", type="primary", use_container_width=True):
-                            if not st.session_state.similarity_model_loaded:
-                                st.error("❌ Similarity model not loaded. Please load in sidebar.")
-                            else:
+                        st.warning(f"⏱️ Estimated time: ~{len(pairs_df) * delay * 2 / 60:.1f} minutes (with {delay}s delays)")
+                        
+                        if st.button("🚀 Run Bulk (Sequential)", type="primary", key="link_bulk_analyze"):
+                            if st.session_state.similarity_model_loaded:
+                                sim_client = st.session_state.similarity_model
+                                sim_client.scraper.delay = delay
+                                
                                 progress_bar = st.progress(0)
-                                status_text = st.empty()
+                                status = st.empty()
                                 
-                                similarity_client = st.session_state.similarity_model
-                                results = []
+                                def progress_callback(current, total):
+                                    progress_bar.progress(current / 100)
+                                    status.text(f"Progress: {current}%")
                                 
-                                for idx, row in pairs_df.iterrows():
-                                    status_text.text(f"Processing pair {idx+1}/{len(pairs_df)}...")
+                                with st.spinner("Processing sequentially..."):
+                                    pairs = list(zip(pairs_df['external_url'], pairs_df['target_url']))
+                                    results = sim_client.get_similarity_bulk(pairs, progress_callback)
                                     
-                                    result = similarity_client.get_similarity(
-                                        row['external_url'],
-                                        row['target_url']
-                                    )
-                                    
-                                    if result:
-                                        results.append(result)
-                                    else:
-                                        logger.warning(f"Failed to process pair {idx+1}")
-                                    
-                                    progress_bar.progress((idx + 1) / len(pairs_df))
-                                    time.sleep(0.1)
-                                
-                                st.session_state.link_analysis_results = results
-                                status_text.text("")
-                                st.success(f"✅ Analyzed {len(results)}/{len(pairs_df)} pairs!")
-                                st.rerun()
+                                    st.session_state.link_analysis_results = results
+                                    status.text("")
+                                    st.success(f"✅ Analyzed {len(results)} pairs!")
+                                    st.rerun()
+                            else:
+                                st.error("❌ Load model first")
                 
                 except Exception as e:
-                    st.error(f"❌ Error reading CSV: {str(e)}")
-                    logger.error(f"CSV reading error: {e}")
+                    st.error(f"❌ Error: {e}")
         
-        # Display Bulk Results
         if st.session_state.link_analysis_results:
             st.markdown("---")
-            st.markdown("### 📊 Analysis Results")
+            st.markdown("### 📊 Basic Results")
             
             results_df = pd.DataFrame(st.session_state.link_analysis_results)
             
-            avg_similarity = results_df['similarity'].mean()
-            off_topic_count = (results_df['interpretation'] == 'Off-Topic').sum()
-            on_topic_count = (results_df['interpretation'] == 'On-Topic').sum()
+            avg_sim = results_df['similarity'].mean()
+            off_topic = (results_df['interpretation'] == 'Off-Topic').sum()
+            on_topic = (results_df['interpretation'] == 'On-Topic').sum()
             
-            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-            
-            with metric_col1:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3 style="margin:0; font-size:2rem;">{len(results_df)}</h3>
-                    <p style="margin:0;">Total Pairs</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with metric_col2:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3 style="margin:0; font-size:2rem;">{avg_similarity:.3f}</h3>
-                    <p style="margin:0;">Avg Similarity</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with metric_col3:
-                st.markdown(f"""
-                <div class="success-card">
-                    <h3 style="margin:0; font-size:2rem;">{on_topic_count}</h3>
-                    <p style="margin:0;">On-Topic</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with metric_col4:
-                st.markdown(f"""
-                <div class="warning-card">
-                    <h3 style="margin:0; font-size:2rem;">{off_topic_count}</h3>
-                    <p style="margin:0;">Off-Topic</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            st.markdown("<br>", unsafe_allow_html=True)
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.markdown(f'<div class="metric-card"><h3>{len(results_df)}</h3><p>Pairs</p></div>', unsafe_allow_html=True)
+            with col2:
+                st.markdown(f'<div class="metric-card"><h3>{avg_sim:.3f}</h3><p>Avg</p></div>', unsafe_allow_html=True)
+            with col3:
+                st.markdown(f'<div class="success-card"><h3>{on_topic}</h3><p>On-Topic</p></div>', unsafe_allow_html=True)
+            with col4:
+                st.markdown(f'<div class="warning-card"><h3>{off_topic}</h3><p>Off-Topic</p></div>', unsafe_allow_html=True)
             
             col_v1, col_v2 = st.columns(2)
-            
             with col_v1:
                 fig_dist = create_similarity_distribution(results_df)
                 st.plotly_chart(fig_dist, use_container_width=True)
-            
             with col_v2:
                 fig_pie = create_interpretation_pie(results_df)
                 st.plotly_chart(fig_pie, use_container_width=True)
             
-            if len(results_df) > 2:
-                fig_heatmap = create_heatmap_analysis(results_df)
-                st.plotly_chart(fig_heatmap, use_container_width=True)
+            st.dataframe(results_df[['external_url', 'target_url', 'similarity', 
+                                     'interpretation', 'extraction_methods']])
             
-            st.markdown("#### 📋 Detailed Results")
-            display_df = results_df[[
-                'external_url', 'target_url', 'similarity', 
-                'interpretation', 'timestamp'
-            ]].copy()
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-            
-            st.markdown("#### 💾 Export Results")
-            col_dl1, col_dl2, col_dl3 = st.columns(3)
-            
-            with col_dl1:
-                csv = results_df.to_csv(index=False)
-                st.download_button(
-                    label="📊 Download results.csv",
-                    data=csv,
-                    file_name=f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            
-            with col_dl2:
-                audit_card = results_df['interpretation'].value_counts().reset_index()
-                audit_card.columns = ['Interpretation', 'Count']
-                audit_csv = audit_card.to_csv(index=False)
-                st.download_button(
-                    label="📊 Download audit_card.csv",
-                    data=audit_csv,
-                    file_name=f"audit_card_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+            csv = results_df.to_csv(index=False)
+            st.download_button("📊 Download results.csv", csv, 
+                             f"results_{datetime.now().strftime('%Y%m%d')}.csv",
+                             key="link_download_results")
     
-    # ==================== TAB 3 & 4: Same as before ====================
+    # TAB 3: ADVANCED VISUALIZATIONS (NEW)
     with tab3:
-        st.markdown('<h2 class="sub-header">Domain Pattern Analysis</h2>', 
-                    unsafe_allow_html=True)
-        
-        st.markdown("""
-        <div class="info-box">
-            <strong>🎯 Link Farm Detection:</strong> Identify domains with suspicious patterns using offline analysis.
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown('<h2 class="sub-header">Advanced Visualizations</h2>', unsafe_allow_html=True)
         
         if not st.session_state.link_analysis_results:
-            st.info("👆 Run Link Authority Analysis first to see domain patterns")
+            st.info("Run Link Authority Analysis first to see advanced visualizations")
         else:
             results_df = pd.DataFrame(st.session_state.link_analysis_results)
             
-            if st.button("🔄 Analyze Domain Patterns", type="primary", use_container_width=True):
-                with st.spinner("🔍 Analyzing domain patterns..."):
+            # Advanced Similarity Analysis
+            st.markdown("### 📊 Comprehensive Similarity Analysis")
+            fig_advanced = create_advanced_similarity_analysis(results_df)
+            st.plotly_chart(fig_advanced, use_container_width=True)
+            
+            # Sunburst Chart
+            st.markdown("### 🌅 Quality Hierarchy (Sunburst)")
+            fig_sunburst = create_interpretation_sunburst(results_df)
+            st.plotly_chart(fig_sunburst, use_container_width=True)
+            
+            # Timeline
+            st.markdown("### 📈 Score Timeline")
+            fig_timeline = create_score_timeline(results_df)
+            st.plotly_chart(fig_timeline, use_container_width=True)
+            
+            # Statistical Summary Table
+            st.markdown("### 📋 Statistical Summary")
+            stats_table = create_statistical_summary_table(results_df)
+            st.dataframe(stats_table, use_container_width=True, hide_index=True)
+            
+            # Domain Treemap (if domain analysis done)
+            if isinstance(st.session_state.domain_summary, pd.DataFrame):
+                st.markdown("### 🗺️ Domain Authority Treemap")
+                fig_treemap = create_domain_treemap(st.session_state.domain_summary)
+                st.plotly_chart(fig_treemap, use_container_width=True)
+    
+    # TAB 4: KEY FINDINGS (NEW)
+    with tab4:
+        st.markdown('<h2 class="sub-header">Key Findings & Recommendations</h2>', unsafe_allow_html=True)
+        
+        if not st.session_state.link_analysis_results:
+            st.info("Run Link Authority Analysis first to generate key findings")
+        else:
+            results_df = pd.DataFrame(st.session_state.link_analysis_results)
+            
+            # Generate domain summary if not already done
+            if not isinstance(st.session_state.domain_summary, pd.DataFrame):
+                with st.spinner("Analyzing domains..."):
                     domain_summary = analyze_domain_pattern(
-                        results_df,
-                        min_pairs=min_pairs,
-                        off_topic_threshold=off_topic_threshold,
-                        avg_score_threshold=avg_score_threshold
+                        results_df, min_pairs, off_topic_threshold, avg_score_threshold
                     )
                     st.session_state.domain_summary = domain_summary
-                    st.success("✅ Analysis complete!")
+            else:
+                domain_summary = st.session_state.domain_summary
             
-            if isinstance(st.session_state.domain_summary, pd.DataFrame) and \
-               len(st.session_state.domain_summary) > 0:
+            # Generate key findings
+            findings = analyze_key_findings(results_df, domain_summary)
+            
+            # Overall Health Score
+            st.markdown("### 🏥 Overall Health Score")
+            health = findings['overall_health']
+            
+            col_health1, col_health2, col_health3 = st.columns(3)
+            with col_health1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h2 style="font-size:4rem; margin:0;">{health['score']}</h2>
+                    <p style="font-size:1.5rem; margin:0;">/100</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col_health2:
+                st.markdown(f"""
+                <div class="info-card">
+                    <h3>Grade</h3>
+                    <h2 style="font-size:3rem; margin:0;">{health['grade']}</h2>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col_health3:
+                status_class = "success-card" if health['score'] >= 80 else "warning-card" if health['score'] >= 60 else "critical-finding"
+                st.markdown(f"""
+                <div class="{status_class}">
+                    <h3>Status</h3>
+                    <h2>{health['status']}</h2>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Critical Issues
+            if findings['critical_issues']:
+                st.markdown("### 🚨 Critical Issues")
+                for issue in findings['critical_issues']:
+                    severity_color = "#f5576c" if issue['severity'] == 'HIGH' else "#ffd93d"
+                    st.markdown(f"""
+                    <div class="critical-finding" style="background: linear-gradient(135deg, {severity_color} 0%, {severity_color}dd 100%);">
+                        <h4>[{issue['severity']}] {issue['issue']}</h4>
+                        <p><strong>Detail:</strong> {issue['detail']}</p>
+                        <p><strong>Impact:</strong> {issue['impact']}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="success-card">
+                    <h3>✅ No Critical Issues Found</h3>
+                    <p>Your link profile is in good health!</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Recommendations
+            st.markdown("### 💡 Recommendations")
+            for rec in findings['recommendations']:
+                priority_color = {"CRITICAL": "#f5576c", "HIGH": "#ff9a76", "MEDIUM": "#ffd93d", "LOW": "#38ef7d"}
+                color = priority_color.get(rec['priority'], "#667eea")
+                
+                st.markdown(f"""
+                <div class="finding-box" style="border-left-color: {color};">
+                    <h4>[{rec['priority']}] {rec['action']}</h4>
+                    <p>{rec['detail']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Risk Assessment
+            st.markdown("### ⚠️ Risk Assessment")
+            risk = findings['risk_assessment']
+            
+            risk_colors = {"CRITICAL": "#f5576c", "HIGH": "#ff9a76", "MEDIUM": "#ffd93d", "LOW": "#38ef7d"}
+            risk_color = risk_colors.get(risk['level'], "#667eea")
+            
+            st.markdown(f"""
+            <div class="critical-finding" style="background: linear-gradient(135deg, {risk_color} 0%, {risk_color}dd 100%);">
+                <h3>Overall Risk Level: {risk['level']}</h3>
+                <p><strong>Manual Action Risk:</strong> {risk['manual_action_risk']}</p>
+                <p><strong>Penalty Risk:</strong> {risk['penalty_risk']}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Key Statistics
+            st.markdown("### 📊 Key Statistics")
+            stats = findings['statistics']
+            
+            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+            with col_s1:
+                st.metric("Total Links", stats['total_links'])
+                st.metric("Avg Similarity", f"{stats['avg_similarity']:.3f}")
+            with col_s2:
+                st.metric("On-Topic", f"{stats['on_topic']} ({stats['on_topic_rate']}%)")
+                st.metric("Off-Topic", f"{stats['off_topic']} ({stats['off_topic_rate']}%)")
+            with col_s3:
+                st.metric("Total Domains", stats['total_domains'])
+                st.metric("Flagged Domains", f"{stats['flagged_domains']} ({stats['domain_flag_rate']}%)")
+            with col_s4:
+                st.metric("Median Similarity", f"{stats['median_similarity']:.3f}")
+                st.metric("Std Deviation", f"{stats['std_similarity']:.3f}")
+            
+            # Download Advanced Report
+            st.markdown("### 💾 Export Advanced Report")
+            advanced_report = generate_advanced_report(results_df, domain_summary, findings)
+            st.download_button(
+                "📄 Download Advanced Report (Markdown)",
+                advanced_report,
+                f"advanced_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                key="download_advanced_report"
+            )
+    
+    # TAB 5: Analytics Dashboard (Enhanced from previous version)
+    with tab5:
+        st.markdown('<h2 class="sub-header">Analytics Dashboard</h2>', unsafe_allow_html=True)
+        
+        has_probe = len(st.session_state.probe_results) > 0
+        has_link = len(st.session_state.link_analysis_results) > 0
+        
+        if not has_probe and not has_link:
+            st.info("No data yet. Run analyses to see comprehensive dashboard.")
+        else:
+            st.markdown("### 📈 Overview")
+            
+            cols = st.columns(3)
+            with cols[0]:
+                if has_probe:
+                    avg_cons = np.mean([r['consistency_score'] for r in st.session_state.probe_results])
+                    st.markdown(f'<div class="info-card"><h4>Probing</h4><p>{len(st.session_state.probe_results)} probes</p><p>Avg: {avg_cons:.1f}%</p></div>', unsafe_allow_html=True)
+            
+            with cols[1]:
+                if has_link:
+                    results_df = pd.DataFrame(st.session_state.link_analysis_results)
+                    st.markdown(f'<div class="info-card"><h4>Link Analysis</h4><p>{len(results_df)} pairs</p><p>Avg: {results_df["similarity"].mean():.3f}</p></div>', unsafe_allow_html=True)
+            
+            with cols[2]:
+                if isinstance(st.session_state.domain_summary, pd.DataFrame):
+                    domain_summary = st.session_state.domain_summary
+                    flagged = domain_summary['flagged'].sum()
+                    st.markdown(f'<div class="warning-card"><h4>Domains</h4><p>{len(domain_summary)} analyzed</p><p>{flagged} flagged</p></div>', unsafe_allow_html=True)
+            
+            # Domain Patterns Section
+            if isinstance(st.session_state.domain_summary, pd.DataFrame):
+                st.markdown("---")
+                st.markdown("### 📊 Domain Patterns")
                 
                 domain_summary = st.session_state.domain_summary
                 
-                total_domains = len(domain_summary)
-                flagged_domains = domain_summary['flagged'].sum()
-                worst_score = domain_summary['avg_score'].min()
+                total = len(domain_summary)
+                flagged = domain_summary['flagged'].sum()
+                worst = domain_summary['avg_score'].min()
                 
-                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.markdown(f'<div class="metric-card"><h3>{total}</h3><p>Domains</p></div>', unsafe_allow_html=True)
+                with col2:
+                    st.markdown(f'<div class="warning-card"><h3>{flagged}</h3><p>Flagged</p></div>', unsafe_allow_html=True)
+                with col3:
+                    st.markdown(f'<div class="info-card"><h3>{worst:.3f}</h3><p>Worst</p></div>', unsafe_allow_html=True)
+                with col4:
+                    flag_rate = (flagged / total * 100) if total > 0 else 0
+                    st.markdown(f'<div class="metric-card"><h3>{flag_rate:.1f}%</h3><p>Flag Rate</p></div>', unsafe_allow_html=True)
                 
-                with metric_col1:
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3 style="margin:0; font-size:2rem;">{total_domains}</h3>
-                        <p style="margin:0;">Total Domains</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with metric_col2:
-                    card_class = "warning-card" if flagged_domains > 0 else "success-card"
-                    st.markdown(f"""
-                    <div class="{card_class}">
-                        <h3 style="margin:0; font-size:2rem;">{flagged_domains}</h3>
-                        <p style="margin:0;">Flagged Domains</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with metric_col3:
-                    st.markdown(f"""
-                    <div class="info-card">
-                        <h3 style="margin:0; font-size:2rem;">{worst_score:.3f}</h3>
-                        <p style="margin:0;">Worst Avg Score</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with metric_col4:
-                    flag_rate = (flagged_domains / total_domains * 100) if total_domains > 0 else 0
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3 style="margin:0; font-size:2rem;">{flag_rate:.1f}%</h3>
-                        <p style="margin:0;">Flag Rate</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                st.markdown("<br>", unsafe_allow_html=True)
-                
-                fig_domain = create_domain_comparison(domain_summary)
-                st.plotly_chart(fig_domain, use_container_width=True)
+                fig = create_domain_comparison(domain_summary)
+                st.plotly_chart(fig, use_container_width=True)
                 
                 flagged_df = domain_summary[domain_summary['flagged'] == True]
                 
                 if len(flagged_df) > 0:
-                    st.markdown("### 🚨 Suspect Link Farms")
-                    
-                    for _, row in flagged_df.iterrows():
-                        with st.expander(f"⚠️ {row['external_domain']} - FLAGGED", expanded=True):
-                            col1, col2, col3, col4 = st.columns(4)
-                            
+                    st.markdown("### 🚨 Suspect Domains")
+                    for idx, row in flagged_df.iterrows():
+                        with st.expander(f"⚠️ {row['external_domain']}", key=f"domain_exp_{idx}"):
+                            col1, col2, col3 = st.columns(3)
                             with col1:
-                                st.metric("Avg Score", f"{row['avg_score']:.3f}")
+                                st.metric("Avg", f"{row['avg_score']:.3f}")
                             with col2:
-                                st.metric("Off-Topic Rate", f"{row['off_topic_rate']:.1%}")
+                                st.metric("Off-Topic", f"{row['off_topic_rate']:.1%}")
                             with col3:
-                                st.metric("Total Pairs", int(row['pair_count']))
-                            with col4:
-                                st.metric("Verdict", row['verdict'])
-                            
-                            domain_urls = results_df[
-                                results_df['external_url'].str.contains(row['external_domain'], regex=False)
-                            ][['external_url', 'target_url', 'similarity', 'interpretation']].head(5)
-                            
-                            st.markdown("**Example Links:**")
-                            st.dataframe(domain_urls, use_container_width=True, hide_index=True)
+                                st.metric("Pairs", int(row['pair_count']))
                 else:
-                    st.markdown("""
-                    <div class="success-card">
-                        <h3>✅ No Suspect Domains Found</h3>
-                        <p>All analyzed domains meet quality thresholds</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown('<div class="success-card"><h3>✅ No Suspect Domains</h3></div>', unsafe_allow_html=True)
                 
-                st.markdown("### 📊 All Domains Summary")
+                st.dataframe(domain_summary)
                 
-                display_summary = domain_summary.copy()
-                display_summary['avg_score'] = display_summary['avg_score'].round(3)
-                display_summary['off_topic_rate'] = (display_summary['off_topic_rate'] * 100).round(1)
-                display_summary = display_summary.rename(columns={
-                    'external_domain': 'Domain',
-                    'avg_score': 'Avg Score',
-                    'min_score': 'Min Score',
-                    'max_score': 'Max Score',
-                    'pair_count': 'Pairs',
-                    'off_topic_count': 'Off-Topic Count',
-                    'off_topic_rate': 'Off-Topic %',
-                    'flagged': 'Flagged',
-                    'verdict': 'Verdict'
-                })
-                
-                st.dataframe(display_summary, use_container_width=True, hide_index=True)
-                
-                st.markdown("#### 💾 Export Domain Analysis")
+                # Downloads
                 col_dl1, col_dl2 = st.columns(2)
-                
                 with col_dl1:
                     csv = domain_summary.to_csv(index=False)
-                    st.download_button(
-                        label="📊 Download domain_summary_cmseo.csv",
-                        data=csv,
-                        file_name=f"domain_summary_cmseo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                
+                    st.download_button("📊 Download domain_summary.csv", csv, 
+                                     f"domain_summary_{datetime.now().strftime('%Y%m%d')}.csv",
+                                     key="domain_download_summary")
                 with col_dl2:
-                    findings_md = generate_cmseo_findings(domain_summary)
-                    st.download_button(
-                        label="📄 Download cmseo_findings.md",
-                        data=findings_md,
-                        file_name=f"cmseo_findings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-                        mime="text/markdown",
-                        use_container_width=True
-                    )
-    
-    with tab4:
-        st.markdown('<h2 class="sub-header">Analytics Dashboard</h2>', 
-                    unsafe_allow_html=True)
-        
-        has_probe_data = len(st.session_state.probe_results) > 0
-        has_link_data = len(st.session_state.link_analysis_results) > 0
-        
-        if not has_probe_data and not has_link_data:
-            st.info("📊 No data available yet. Run analyses in other tabs to see comprehensive analytics.")
-        else:
-            st.markdown("### 📈 Combined Overview")
-            
-            overview_cols = st.columns(3)
-            
-            with overview_cols[0]:
-                if has_probe_data:
-                    avg_cons = np.mean([r['consistency_score'] for r in st.session_state.probe_results])
-                    st.markdown(f"""
-                    <div class="info-card">
-                        <h4>Model Probing</h4>
-                        <p><strong>{len(st.session_state.probe_results)}</strong> probes completed</p>
-                        <p>Avg consistency: <strong>{avg_cons:.1f}%</strong></p>
-                        <p>Model: <strong>{st.session_state.probe_results[0].get('model_used', 'N/A')}</strong></p>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            with overview_cols[1]:
-                if has_link_data:
-                    results_df = pd.DataFrame(st.session_state.link_analysis_results)
-                    st.markdown(f"""
-                    <div class="info-card">
-                        <h4>Link Analysis (Offline)</h4>
-                        <p><strong>{len(results_df)}</strong> pairs analyzed</p>
-                        <p>Avg similarity: <strong>{results_df['similarity'].mean():.3f}</strong></p>
-                        <p>On-topic: <strong>{(results_df['interpretation'] == 'On-Topic').sum()}</strong></p>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            with overview_cols[2]:
-                if isinstance(st.session_state.domain_summary, pd.DataFrame):
-                    domain_summary = st.session_state.domain_summary
-                    flagged = domain_summary['flagged'].sum()
-                    card_class = "warning-card" if flagged > 0 else "success-card"
-                    st.markdown(f"""
-                    <div class="{card_class}">
-                        <h4>Domain Patterns</h4>
-                        <p><strong>{len(domain_summary)}</strong> domains analyzed</p>
-                        <p><strong>{flagged}</strong> flagged as suspect</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    findings = generate_cmseo_findings(domain_summary)
+                    st.download_button("📄 Download findings.md", findings,
+                                     f"findings_{datetime.now().strftime('%Y%m%d')}.md",
+                                     key="domain_download_findings")
 
-# ==================== RUN APPLICATION ====================
 if __name__ == "__main__":
     main()

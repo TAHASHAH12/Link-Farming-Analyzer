@@ -8,3 +8,10 @@ google-genai
 sentence-transformers
 torch
 beautifulsoup4
+lxml
+urllib3
+# Advanced scraping (optional but recommended)
+selenium
+playwright
+webdriver-manager
+chardet
